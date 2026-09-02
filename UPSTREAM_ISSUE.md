@@ -122,3 +122,58 @@ i.e. **every** group is treated as volatile draft KV. Disabling speculation remo
 classification entirely. If that fallback is intended to be conservative it may be worth
 narrowing, since as written it applies draft-volatility semantics to ordinary
 full-attention groups.
+
+---
+
+# Second defect: the offload read path never produces a hit (write-only offloading)
+
+Same build and model. After working around the assert above with
+`--prefix-match-unit 4`, offloading initialises and **stores work**, but **no load ever
+happens**:
+
+```
+vllm:kv_offload_total_bytes_total{transfer_type="GPU_to_CPU"} = 1.0097721344e+10   # 10 GB
+vllm:kv_offload_total_bytes_total{transfer_type="CPU_to_GPU"} = 0.0                # always
+```
+
+## What was ruled out
+
+Each of these was eliminated with a separate run, and the result never changed:
+
+| possibility | how it was excluded |
+|---|---|
+| blocks evicted before reuse | disk cap raised to 100 GiB; 22 GB of blocks present, **no eviction** |
+| non-deterministic block hashes | `PYTHONHASHSEED=0` verified with `docker exec printenv` |
+| lookups disabled for the request | `skip_reading_prefix_cache` is only set when `prompt_logprobs` is used; the same requests **do** get GPU prefix-cache hits |
+| empty lookup group set | `_lookup_groups` = full-attention + sliding-window = all 7 groups |
+| draft/EAGLE volatility exclusion | reproduced with `SPEC_METHOD=none`, log shows `EAGLE lines: 0` |
+| CPU-tier allocation failure | `cpu_bytes_to_use` raised until `kv_offload_allocation_failure` stopped and stores succeeded |
+| memory starvation | MemAvailable 18.2–18.4 GiB stable for the whole run |
+| async lookup needing a prime, then masked by the GPU prefix cache | two-eviction-cycle test below |
+
+## The async-priming test (the strongest check)
+
+`FileSystemTierManager` looks up through `FsAsyncLookupManager`, so a first
+post-eviction request might only prime the lookup — and because that request
+repopulates the GPU prefix cache, an immediate repeat is served by APC and never
+consults offload. To defeat that masking, s0 was evicted **twice**:
+
+```
+s0 cold (seed)      TTFT=27.66s  cached=0/15494  CPU_to_GPU +0.0 MiB
+[11 filler sessions -> s0 evicted from a 168,521-token pool]
+attempt A (prime)   TTFT=21.33s  cached=0/15494  CPU_to_GPU +0.0 MiB
+[11 more fillers -> s0 evicted again]
+attempt B (primed)  TTFT=15.65s  cached=0/15494  CPU_to_GPU +0.0 MiB
+```
+
+Full prefill each time, `cached_tokens=0`, zero bytes read back.
+
+## Impact
+
+Offloading is effectively write-only: it consumes CPU memory, disk and write bandwidth
+while never serving a read, so it is a pure cost. On a unified-memory machine (NVIDIA GB10)
+that is actively harmful, because the CPU tier is taken from the same pool as weights and
+KV.
+
+Happy to run further diagnostics — instrumenting `_lookup_complete_chunks` to log the
+looked-up vs stored keys would be the obvious next step, but that needs a debug build.
