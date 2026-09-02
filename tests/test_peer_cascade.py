@@ -107,8 +107,8 @@ check("events.py still asserts hashes_per_chunk > 0",
       "assert hashes_per_chunk > 0" in ev_src)
 
 print("=== 4. wire framing (regression guard) ===")
-peer_mod = load(os.path.join(ROOT, "vllm_bounded_fs_tier_peer.py"),
-                "vllm_bounded_fs_tier_peer_t")
+peer_mod = load(os.path.join(ROOT, "vllm_bounded_fs_tier.py"),
+                "vllm_bounded_fs_tier_t")
 _Peer = peer_mod._Peer
 p = _Peer("127.0.0.1:1", rank=1, timeout=1)
 
