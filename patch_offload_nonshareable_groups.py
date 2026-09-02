@@ -90,6 +90,7 @@ from pathlib import Path
 
 VLLM = Path("/usr/local/lib/python3.12/dist-packages/vllm")
 SCHED = VLLM / "distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py"
+CONFIG = VLLM / "distributed/kv_transfer/kv_connector/v1/offloading/config.py"
 
 MARK = "[glm53-offload-nonshareable]"
 
@@ -187,19 +188,131 @@ LOAD_NEW = '''            self._current_batch_allocated_block_ids.update(
 '''
 LOAD_SENTINEL = "# LOCAL [glm53-offload-nonshareable]: never stored"
 
+
+# --- edit 4: the divisibility assert must skip the same groups ------------
+# Without this, OffloadingConnector cannot initialise at all unless the operator
+# forces --prefix-match-unit down to the scratch group's block size (4), which
+# drags the GPU prefix-cache hash granularity along with it. Filtering the
+# assert instead lets a deployment keep its tuned grain (64 here) untouched.
+# resolve_kv_cache_block_sizes() already excludes exactly these groups when it
+# derives tokens_per_hash, and KVCacheSpec.participates_in_prefix_caching's
+# docstring names "the hybrid divisibility assert" as a consumer that must too.
+# NOTE: `groups` itself is left intact -- it is consumed positionally.
+ASSERT_OLD = """    _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+    for group in groups:
+        assert group.tokens_per_block % tokens_per_hash == 0, (
+"""
+ASSERT_NEW = """    _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+    for group, _kv_group in zip(groups, kv_cache_config.kv_cache_groups):
+        # LOCAL [glm53-offload-nonshareable]: groups that opt out of prefix
+        # caching never have block_hashes computed, so their block_size must not
+        # constrain the hash granularity -- exactly the filter
+        # resolve_kv_cache_block_sizes applies when deriving tokens_per_hash.
+        if not _kv_group.kv_cache_spec.participates_in_prefix_caching:
+            continue
+        assert group.tokens_per_block % tokens_per_hash == 0, (
+"""
+ASSERT_SENTINEL = "for group, _kv_group in zip(groups, kv_cache_config.kv_cache_groups):"
+
+
+# --- edit 5: keep hashes_per_chunk >= 1 so nothing can divide by zero -------
+# The config.py assert we filter in edit 4 was also guarding real arithmetic:
+# for the scratch group hashes_per_chunk == tokens_per_block // tokens_per_hash
+# == 4 // 64 == 0, and three consumers break on that --
+#   scheduler.update_offload_keys(): islice(hashes, -1, None, 0) -> ValueError,
+#     and it iterates EVERY group, so this would raise on the first request;
+#   events.py:193  tokens_per_hash = tokens_per_chunk // hashes_per_chunk -> ZeroDivisionError;
+#   events.py:263  assert hashes_per_chunk > 0.
+# Clamping to 1 keeps all of them well-defined. The value is only ever used to
+# walk block_hashes and to label KV events; the scratch group is excluded from
+# lookup, store and load by the other edits, so its keys are never consumed --
+# but they are now built harmlessly instead of raising.
+CLAMP_OLD = """                    hashes_per_chunk=(
+                        (tokens_per_block * spec.blocks_per_chunk)
+                        // spec.tokens_per_hash
+                    ),
+"""
+CLAMP_NEW = """                    hashes_per_chunk=max(
+                        1,
+                        (tokens_per_block * spec.blocks_per_chunk)
+                        // spec.tokens_per_hash,
+                    ),
+"""
+CLAMP_SENTINEL = "hashes_per_chunk=max("
+
+
+# --- edit 6: keep tiny-granularity SWA/draft groups out of offload ----------
+# The offload region uses ONE uniform row size for every group (the max), so a
+# group whose tokens_per_chunk is far below the full-attention alignment writes
+# a full-size row per tiny chunk. Measured on GLM-5.3-Flash with DFlash2: the
+# drafter group (SlidingWindowManager, block_size=64) produced 1276 of 1410
+# files -- 90% of 72 GB -- because it emits a 54.33 MB row every 64 tokens.
+# That is ~683 KB per token per rank against 11 KB/token in the GPU pool, which
+# makes disk offload strictly worse than simply keeping a larger GPU pool.
+#
+# `alignment_chunk_count is not None` is vLLM's own marker for exactly this
+# shape ("SWA groups have much smaller block sizes than the MLA full-attention
+# group"), so it is the selector.
+#
+# Correctness: these are EAGLE/MTP draft groups. Draft tokens are verified by
+# the target model, so draft KV that was not restored costs acceptance rate
+# while it refills, never output correctness -- and vLLM already treats the
+# trailing chunk of these groups as volatile for the same reason.
+SWA_OLD = """        full_attention_groups: list[int] = []
+        sliding_window_groups: list[int] = []
+        for group_config in self.config.kv_group_configs:
+            if group_config.group_idx in self._non_shareable_groups:
+                continue
+"""
+SWA_NEW = """        import os as _os
+
+        if _os.environ.get("GLM53_OFFLOAD_SKIP_SMALL_SWA", "1") == "1":
+            _small_swa = frozenset(
+                gc.group_idx
+                for gc in self.config.kv_group_configs
+                if gc.alignment_chunk_count is not None
+            )
+            _added = sorted(_small_swa - self._non_shareable_groups)
+            if _added:
+                logger.info(
+                    "KV offloading: groups %s are fine-grained SWA/draft groups "
+                    "(tokens_per_chunk << full-attention alignment); excluded "
+                    "from offload because the uniform region row size would "
+                    "inflate storage by orders of magnitude. Draft KV is "
+                    "verified by the target model, so this costs acceptance "
+                    "rate while it refills, not correctness. Set "
+                    "GLM53_OFFLOAD_SKIP_SMALL_SWA=0 to offload them anyway.",
+                    _added,
+                )
+            self._non_shareable_groups = self._non_shareable_groups | _small_swa
+
+        full_attention_groups: list[int] = []
+        sliding_window_groups: list[int] = []
+        for group_config in self.config.kv_group_configs:
+            if group_config.group_idx in self._non_shareable_groups:
+                continue
+"""
+SWA_SENTINEL = "GLM53_OFFLOAD_SKIP_SMALL_SWA"
+
+CONFIG_EDITS = [
+    ("config:assert-filter", ASSERT_OLD, ASSERT_NEW, ASSERT_SENTINEL),
+]
+
 EDITS = [
     ("sched:init-filter", INIT_OLD, INIT_NEW, INIT_SENTINEL),
     ("sched:store-skip", STORE_OLD, STORE_NEW, STORE_SENTINEL),
     ("sched:load-skip", LOAD_OLD, LOAD_NEW, LOAD_SENTINEL),
+    ("sched:hashes-clamp", CLAMP_OLD, CLAMP_NEW, CLAMP_SENTINEL),
+    ("sched:small-swa-skip", SWA_OLD, SWA_NEW, SWA_SENTINEL),
 ]
 
 
-def apply_edits(path: Path) -> str:
+def apply_edits(path: Path, edits=None) -> str:
     if not path.is_file():
         return f"MISSING {path} - not patched"
     src = path.read_text()
     applied, skipped = [], []
-    for label, old, new, sentinel in EDITS:
+    for label, old, new, sentinel in (EDITS if edits is None else edits):
         if sentinel in src:
             skipped.append(label)
             continue
@@ -227,6 +340,7 @@ def main() -> int:
         print(f"{MARK} disabled (GLM53_OFFLOAD_GROUP_FILTER != 1); vLLM pristine")
         return 0
     print(f"{MARK} {apply_edits(SCHED)}")
+    print(f"{MARK} {apply_edits(CONFIG, CONFIG_EDITS)}")
     return 0
 
 

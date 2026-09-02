@@ -190,3 +190,25 @@ Restores served from disk, needle-verified, on 2x DGX Spark (TP=2, two hosts):
 **15.5 s -> 2.6 s (5.8-6.0x)**, 13,312 tokens cached, 8 FS-tier block hits per
 session, both ranks holding their own shard. The same config without the
 cascade returned 512 empty tokens.
+
+## Production notes
+
+* `patch_offload_nonshareable_groups.py` carries six idempotent edits, all gated
+  on `GLM53_OFFLOAD_GROUP_FILTER=1` and fail-closed on upstream drift:
+  the three lookup/store/load filters, the `config.py` divisibility-assert
+  filter (which removes the need to force `--prefix-match-unit` down to the
+  scratch group's block size, so a deployment keeps its tuned prefix-cache
+  grain), a `max(1, ...)` clamp on `hashes_per_chunk` (the assert was also
+  guarding real arithmetic — `islice(..., -1, None, 0)` and two divisions), and
+  the fine-grained SWA/draft-group exclusion that cut one workload's offload
+  footprint from 72 GB to 7.1 GB.
+* Size the CPU tier by the **restore** path, not the store path. vLLM promotes
+  every hit block into the CPU tier before issuing a single CPU->GPU load, so
+  the tier size is the maximum restorable prefix. Cascade bandwidth is never the
+  constraint; a tier that is too small returns `cached=0` and raises
+  `kv_offload_tiering_promotion_allocation_failures_total`.
+* `max_bytes` bounds every rank: the head enforces it with LRU and mirrors each
+  deletion to the peers, and each peer additionally sweeps its own shard
+  oldest-first against the same cap as a backstop.
+* Clear `/dev/shm/vllm_offload_*.mmap` before launch. vLLM never unlinks it, and
+  on unified memory the orphans eventually fail the startup memory gate.

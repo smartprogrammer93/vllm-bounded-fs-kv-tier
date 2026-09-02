@@ -43,7 +43,7 @@ Protocol: newline-delimited JSON over TCP.
   <- {"ok":true,"mmap":"/dev/shm/..."}
   -> {"op":"store"|"load","job_id":J,"keys":[hex,..],"block_ids":[..]}
   <- {"ok":bool,"job_id":J,"num_succeeded":N,"err":str|null}
-  -> {"op":"evict","paths_rel":[..]}         # mirror the head's LRU deletions
+  -> {"op":"evict","paths":[abs,..]}         # mirror the head LRU deletions
   <- {"ok":true,"deleted":N}
 
 A failure here is reported honestly so the head can turn the job into a cache
@@ -58,9 +58,11 @@ import os
 import socketserver
 import sys
 import threading
+import time as _time
 import traceback
 
 LOG_PREFIX = "[peer-kv-agent]"
+_SWEEPER_STARTED = False
 
 try:
     from vllm.v1.kv_offload.tiering.fs.io import batch_load_block, batch_store_block
@@ -148,6 +150,63 @@ class Region:
 REGION = Region()
 
 
+def _sweep_once() -> int:
+    """Trim this rank's shard to the same configurable cap the head enforces.
+
+    Eviction is normally mirrored from the head, which owns the LRU order. This
+    is only a backstop so a dropped message cannot leak disk forever; it deletes
+    oldest-first by mtime, the same policy the head's bounded tier uses.
+    """
+    cfg = REGION.cfg
+    if not cfg:
+        return 0
+    cap = int(cfg.get("max_bytes") or 0)
+    root = cfg.get("root_dir")
+    if cap <= 0 or not root or not os.path.isdir(root):
+        return 0
+    found = []
+    total = 0
+    for dirpath, _dirs, names in os.walk(root):
+        for name in names:
+            if not name.endswith(".bin"):
+                continue
+            fp = os.path.join(dirpath, name)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            found.append((st.st_mtime, fp, st.st_size))
+            total += st.st_size
+    if total <= cap:
+        return 0
+    found.sort()
+    target = int(cap * 0.9)
+    removed = 0
+    for _mt, fp, size in found:
+        if total <= target:
+            break
+        try:
+            os.unlink(fp)
+            total -= size
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        log("backstop sweep removed %d blocks; usage now %.2f GiB of %.2f GiB cap"
+            % (removed, total / 1024 ** 3, cap / 1024 ** 3))
+    return removed
+
+
+def _sweeper():
+    interval = float(os.environ.get("PEER_KV_SWEEP_SECONDS", "60"))
+    while True:
+        try:
+            _sweep_once()
+        except Exception:
+            traceback.print_exc()
+        _time.sleep(interval)
+
+
 def split_key(key_hex: str):
     """OffloadKey = block_hash || group_idx (4 bytes, big-endian)."""
     raw = bytes.fromhex(key_hex)
@@ -158,13 +217,25 @@ def handle(msg: dict) -> dict:
     op = msg.get("op")
     if op == "hello":
         p = REGION.configure(msg)
+        global _SWEEPER_STARTED
+        if not _SWEEPER_STARTED:
+            _SWEEPER_STARTED = True
+            threading.Thread(target=_sweeper, daemon=True,
+                             name="peer-kv-sweeper").start()
+            log("backstop sweeper armed (cap=%.2f GiB)"
+                % (int(msg.get("max_bytes") or 0) / 1024 ** 3))
         return {"ok": True, "mmap": p, "vllm_io": _HAVE_VLLM_IO}
 
     if op == "evict":
+        root = (REGION.cfg or {}).get("root_dir", "/kvoffload")
         n = 0
-        for rel in msg.get("paths_rel", []):
+        for path in msg.get("paths", []):
+            # Never unlink outside the configured cache root.
+            if not os.path.abspath(path).startswith(os.path.abspath(root) + os.sep):
+                log("refusing to unlink outside %s: %r" % (root, path))
+                continue
             try:
-                os.unlink(os.path.join(REGION.cfg["root_dir"], rel))
+                os.unlink(path)
                 n += 1
             except OSError:
                 pass

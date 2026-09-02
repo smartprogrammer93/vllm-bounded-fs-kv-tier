@@ -227,9 +227,9 @@ _pclog = init_logger("vllm.peer_cascade")
 def _plog(level, msg, *args):
     """Log under the vllm.* hierarchy AND to stderr.
 
-    A logger named 'vllm_bounded_fs_tier' is outside vLLM's configured logger
-    tree and its records are silently discarded -- which hid a protocol bug
-    here for a full engine boot. Never let a cascade failure be invisible.
+    A logger named after this module is outside vLLM's configured logger tree
+    and its records are silently discarded -- which hid a wire-protocol bug for
+    a whole engine boot. Never let a cascade failure be invisible.
     """
     try:
         getattr(_pclog, level)(msg, *args)
@@ -332,19 +332,24 @@ class PeerMirroredFileSystemTierManager(BoundedFileSystemTierManager):
             "GLM53_OFFLOAD_PEERS", "")
         self._peer_timeout = float(kwargs.pop("peer_timeout", 0) or
                                    os.environ.get("GLM53_OFFLOAD_PEER_TIMEOUT", "120"))
-        super().__init__(*args, **kwargs)
 
+        # MUST be initialised BEFORE super().__init__(): the bounded parent's
+        # constructor calls _evict_if_needed() to trim an over-cap directory
+        # inherited from a previous run, and our override of that method reads
+        # these attributes. An empty peer list makes it fall through to the
+        # parent, which is the correct behaviour during construction.
         self._peers: list = []
-        addrs = [a.strip() for a in peers_env.split(",") if a.strip()]
-        for i, a in enumerate(addrs):
-            self._peers.append(_Peer(a, rank=i + 1, timeout=self._peer_timeout))
-
-        # job_id -> pending peer ack count / ok flag, and the held parent result
+        self._pool_exec = None
         self._pending: dict = {}
         self._held: list = []
         self._peer_lock = threading.Lock()
         self._load_keys_mirror: dict = {}
-        self._pool_exec = None
+
+        super().__init__(*args, **kwargs)
+
+        addrs = [a.strip() for a in peers_env.split(",") if a.strip()]
+        for i, a in enumerate(addrs):
+            self._peers.append(_Peer(a, rank=i + 1, timeout=self._peer_timeout))
 
         if not self._peers:
             _plog("info", "no peers configured; single-node behaviour")
@@ -357,6 +362,8 @@ class PeerMirroredFileSystemTierManager(BoundedFileSystemTierManager):
             "total_size": int(self._primary_kv_view.nbytes),
             "root_dir": os.environ.get("GLM53_OFFLOAD_PEER_ROOT", "/kvoffload"),
             "o_direct": bool(getattr(self, "_use_o_direct", False)),
+            # The one configurable bound (max_bytes) governs every rank's copy.
+            "max_bytes": int(self._max_bytes),
         }
         for p in self._peers:
             p.set_hello(hello)
@@ -366,9 +373,11 @@ class PeerMirroredFileSystemTierManager(BoundedFileSystemTierManager):
             max_workers=max(2, 2 * len(self._peers)),
             thread_name_prefix="peer-cascade")
         _plog("info",
-              "%d peer rank(s) %s; basename=%s block_size=%d region=%d bytes",
+              "%d peer rank(s) %s; basename=%s block_size=%d region=%d bytes "
+              "cap=%.2f GiB",
               len(self._peers), [p.addr for p in self._peers],
-              hello["basename"], hello["block_size"], hello["total_size"])
+              hello["basename"], hello["block_size"], hello["total_size"],
+              hello["max_bytes"] / 1024 ** 3)
 
     # -- job mirroring ----------------------------------------------------
     def _mirror(self, op: str, job_metadata) -> None:
@@ -443,6 +452,33 @@ class PeerMirroredFileSystemTierManager(BoundedFileSystemTierManager):
                                   successful_keys=None))
             self._held = still_held
         return released
+
+    # -- eviction mirroring ----------------------------------------------
+    def _evict_if_needed(self) -> None:
+        """Mirror the bounded tier's LRU deletions to every peer.
+
+        The cap is enforced once, here, by the parent class; the peers just
+        delete the same blocks from their own shard so a single configurable
+        max_bytes bounds the whole cluster. Cheap: the set diff only runs on
+        the steps that actually evict (_used_bytes() is O(1)).
+        """
+        if not self._peers or self._used_bytes() <= self._max_bytes:
+            super()._evict_if_needed()
+            return
+        before = set(self._tracked)
+        super()._evict_if_needed()
+        removed = before - set(self._tracked)
+        if removed:
+            self._mirror_evict(removed)
+
+    def _mirror_evict(self, paths) -> None:
+        own = "_r%d/" % self.file_mapper.rank
+        for peer in self._peers:
+            mapped = [x.replace(own, "_r%d/" % peer.rank, 1) for x in paths]
+            self._pool_exec.submit(
+                peer.rpc, {"op": "evict", "paths": mapped})
+        _plog("info", "mirrored eviction of %d blocks to %d peer(s)",
+              len(paths), len(self._peers))
 
     def shutdown(self) -> None:
         try:

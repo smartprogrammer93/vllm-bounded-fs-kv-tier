@@ -355,3 +355,70 @@ whole block rows, so the other rank's inert half doubles disk usage; and the CPU
 primary tier must be large enough to accept a promotion — a 4 GiB tier against a
 1 GiB GPU pool produced `kv_offload_tiering_promotion_allocation_failures_total`
 and every lookup missed, while 8 GiB worked.
+
+---
+
+# Fourth defect: the CPU offload region is never unlinked, and it breaks the next boot
+
+`SharedOffloadRegion` creates `/dev/shm/vllm_offload_<engine_id>.mmap` and nothing
+removes it when the engine stops or crashes. Every boot mints a fresh
+`engine_id`, so the orphans accumulate — one per run, at `cpu_bytes_to_use` each.
+
+On a unified-memory machine (NVIDIA GB10) that is not merely wasted tmpfs: shm
+counts against the free device memory vLLM measures at startup, so after a few
+restarts the boot gate fails outright:
+
+```
+ValueError: Free memory on device cuda:0 (102.79/121.63 GiB) on startup is less
+than desired GPU memory utilization (0.85, 103.38 GiB).
+```
+
+We hit exactly this with 8.1 GB of orphaned regions from earlier runs. It is
+self-inflicted denial of service after a crash loop, and the error message points
+the operator at `gpu_memory_utilization`, which is the wrong lever.
+
+**Suggested fix:** unlink the region on graceful shutdown, and on startup reap
+regions whose `engine_id` belongs to no live engine. Our deployment works around
+it by clearing `/dev/shm/vllm_offload_*.mmap` on both hosts before launch.
+
+---
+
+# Fifth issue: one uniform region row size makes fine-grained groups pathological
+
+Not a bug so much as a scaling cliff worth documenting. The offload region uses a
+single row size for every KV group (derived from an average over all blocks), but
+a group's *store rate* is set by its own `tokens_per_chunk`. A group whose chunk
+is far smaller than the full-attention alignment therefore writes a full-size row
+per tiny chunk.
+
+Measured on GLM-5.3-Flash with DFlash2 speculative decoding, `block_size` =
+54.33 MB:
+
+| group | manager | block_size | files written |
+|---|---|---|---|
+| 0 | FullAttention | 3584 | 28 |
+| 1 | KpoolTail | 4 | 0 (excluded, defect 2) |
+| 2-5 | Mamba | 3584 | 28 each |
+| **6** | **SlidingWindow (DFlash2 drafter)** | **64** | **1276** |
+
+Group 6 alone was 90% of 72 GB — it emits a 54.33 MB row every 64 tokens,
+~683 KB per token per rank, against ~11 KB/token in the GPU pool. Excluding it
+dropped the same workload from **72 GB to 7.1 GB** with restores unaffected
+(draft KV is verified by the target model, so not restoring it costs acceptance
+rate while it refills, never correctness — and vLLM already treats these groups'
+trailing chunk as volatile for the same reason).
+
+**Suggested fix:** either size rows per group, or skip groups whose
+`alignment_chunk_count is not None` (vLLM's own marker for this shape) by
+default, or at minimum warn when a group's projected store volume exceeds the
+full-attention group's by an order of magnitude.
+
+## Cost model worth knowing before enabling offload at all
+
+Even with both pathological groups excluded, the remaining 5 groups cost
+~76 KB/token per rank (5 x 54.33 MB per 3584-token chunk) because the Mamba
+groups checkpoint recurrent state. Against ~11 KB/token in the GPU pool that is
+~7x. Where the CPU tier and the GPU pool draw on the *same* unified memory, every
+GiB moved from pool to tier loses ~97k instantly-available pool tokens and buys
+only a ~14k-token restore window — so the tier should be sized as a deliberate
+capacity trade, and the disk tier is the part that actually adds capacity.
