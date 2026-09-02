@@ -124,6 +124,33 @@ INIT_NEW = '''        # LOCAL [glm53-offload-nonshareable]: groups that opt out 
                 sorted(self._non_shareable_groups),
             )
 
+        # LOCAL [glm53-offload-nonshareable] W27a diagnostic: the offload region
+        # uses ONE uniform row stride for every group (an average over all
+        # groups), but the scheduler stores one row per (chunk, group). Log each
+        # group's REAL payload next to the row it is written into, so the waste
+        # is a measured number rather than an inference. If real << row, per-group
+        # row sizing (W27c) is worth building; if they are close, the cost is
+        # genuine and we stop optimising.
+        try:
+            _row = int(self.config.kv_group_configs[0].tokens_per_block)
+            for _g, _kvg in enumerate(kv_cache_config.kv_cache_groups):
+                _spec = _kvg.kv_cache_spec
+                _real = int(
+                    getattr(_spec, "page_size_bytes", 0) * len(_kvg.layer_names)
+                )
+                logger.info(
+                    "KV offloading [W27a]: group %d %s block_size=%s layers=%d "
+                    "real_payload=%.2f MiB",
+                    _g,
+                    type(_spec).__name__,
+                    getattr(_spec, "block_size", "?"),
+                    len(_kvg.layer_names),
+                    _real / 1024 ** 2,
+                )
+        except Exception:
+            logger.warning("KV offloading [W27a]: payload diagnostic failed",
+                           exc_info=True)
+
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
@@ -293,6 +320,8 @@ SWA_NEW = """        import os as _os
                 continue
 """
 SWA_SENTINEL = "GLM53_OFFLOAD_SKIP_SMALL_SWA"
+
+W27A_SENTINEL = "KV offloading [W27a]"
 
 CONFIG_EDITS = [
     ("config:assert-filter", ASSERT_OLD, ASSERT_NEW, ASSERT_SENTINEL),
