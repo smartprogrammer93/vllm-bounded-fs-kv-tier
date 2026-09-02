@@ -119,3 +119,31 @@ request. Parity with the pool is therefore not reachable by layout work alone.
 ## Licence
 
 Apache-2.0. Not affiliated with the vLLM project.
+
+## Open question: is the Mamba recurrent state needed at all?
+
+The Mamba groups are ~97% of the real offload payload, so this decides whether offload can
+be *cheaper* than the GPU pool rather than merely close to it. `probes/mamba_probe.py`
+answers it by excluding them and measuring recall of five needles placed inside the
+restored region:
+
+| arm | Mamba offloaded | pool turnover | restored/session | disk hits | needle recall |
+|---|---|---|---|---|---|
+| B (control) | yes | 6.7x | 307 MiB | 12 | 5/5, 5/5, 5/5 |
+| A | no | 6.7x | 155 MiB | 0 | 5/5, 5/5, 5/5 |
+| A-deep | no | 18.5x | 155 MiB | 4 | 5/5, 5/5, 5/5 |
+
+30/30 needles with the recurrent state never stored and never restored, including runs
+where the attention KV provably came off disk. If that holds up, offload lands near
+7.5 KB/token against the pool's 11 KB/token.
+
+**Deliberately not adopted.** The probe measures retrieval, not generation quality, and the
+mechanism is unknown — the state may simply be replayed from a boundary, or it may not be
+load-bearing for these reads. Enabling `GLM53_OFFLOAD_EXCLUDE_MAMBA=1` when the state *is*
+required is silent wrong output, so it stays an experiment knob until a multi-turn quality
+test and the reseed path are understood.
+
+An exact-match oracle was tried first and rejected: greedy output is not bit-reproducible
+across differing prefill paths, so it flagged noise as corruption. `probes/` includes the
+offline unit tests (22 checks) for the probe's placement, scoring, metrics parsing and
+verdict logic — a live iteration here costs ~15 minutes, an offline one milliseconds.

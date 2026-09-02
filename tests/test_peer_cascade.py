@@ -220,6 +220,20 @@ with tempfile.TemporaryDirectory() as td:
     check("backstop sweep reports what it removed", removed > 0, str(removed))
     check("sweep is a no-op under the cap", agent._sweep_once() == 0)
 
+print("=== 7. patch sentinels must be mutually unique ===")
+import re as _re
+_patch = open(os.path.join(ROOT, "patch_offload_nonshareable_groups.py")).read()
+_sents = dict(_re.findall(r'^(\w+_SENTINEL) = "([^"]+)"', _patch, _re.M))
+_news = dict(_re.findall(r'^(\w+_NEW) = """(.*?)"""', _patch, _re.M | _re.S))
+_collisions = [
+    (a, b) for a, v in _sents.items() for b, n in _news.items()
+    if b != a.replace("_SENTINEL", "_NEW") and v in n
+]
+check("every idempotence sentinel is absent from every OTHER edit's "
+      "replacement text (a shared substring silently SKIPS an edit)",
+      not _collisions, str(_collisions))
+check("found a plausible number of sentinels", len(_sents) >= 9, str(len(_sents)))
+
 print()
 if fails:
     print(f"FAILED ({len(fails)}): " + ", ".join(fails))

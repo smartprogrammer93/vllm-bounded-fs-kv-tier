@@ -295,10 +295,24 @@ SWA_OLD = """        full_attention_groups: list[int] = []
 SWA_NEW = """        import os as _os
 
         if _os.environ.get("GLM53_OFFLOAD_SKIP_SMALL_SWA", "1") == "1":
+            # Mamba groups must be EXEMPT: their tokens_per_chunk equals the
+            # full-attention alignment, so upstream leaves their
+            # alignment_chunk_count None and they are not the fine-grained shape
+            # this exclusion targets. The Mamba snapshot-interval edit sets that
+            # field deliberately, and without this exemption it would make the
+            # Mamba groups match here and be dropped from offload entirely --
+            # observed as "groups [2,3,4,5,6] are fine-grained", with the GPU
+            # prefix cache masking the resulting missing recurrent state.
+            _mamba_groups = frozenset(
+                idx
+                for idx, g in enumerate(kv_cache_config.kv_cache_groups)
+                if isinstance(g.kv_cache_spec, MambaSpec)
+            )
             _small_swa = frozenset(
                 gc.group_idx
                 for gc in self.config.kv_group_configs
                 if gc.alignment_chunk_count is not None
+                and gc.group_idx not in _mamba_groups
             )
             _added = sorted(_small_swa - self._non_shareable_groups)
             if _added:
@@ -313,6 +327,24 @@ SWA_NEW = """        import os as _os
                     _added,
                 )
             self._non_shareable_groups = self._non_shareable_groups | _small_swa
+
+            # EXPERIMENT ONLY (GLM53_OFFLOAD_EXCLUDE_MAMBA=1, default off).
+            # Mamba groups are ~97% of the real offload payload, so whether a
+            # restore actually NEEDS their recurrent state decides whether
+            # offload can ever approach pool parity. This knob excludes them so
+            # that can be measured directly. It is NOT a tuning option: if the
+            # state is needed, enabling this restores attention KV with stale
+            # recurrent state, which is silent wrong output.
+            if _os.environ.get("GLM53_OFFLOAD_EXCLUDE_MAMBA") == "1":
+                self._non_shareable_groups = (
+                    self._non_shareable_groups | _mamba_groups
+                )
+                logger.warning(
+                    "KV offloading: EXPERIMENT -- Mamba groups %s excluded from "
+                    "offload (GLM53_OFFLOAD_EXCLUDE_MAMBA=1). If recurrent state "
+                    "is required for a restore, output will be silently WRONG.",
+                    sorted(_mamba_groups),
+                )
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -361,6 +393,111 @@ COPIES_NEW = """            num_copies = 1 if self.replicated_layout else world_
 """
 COPIES_SENTINEL = "GLM53_OFFLOAD_REGION_COPIES"
 
+
+# --- edits 8+9: snapshot Mamba state every K chunks instead of every chunk ----
+# THE COST: on a hybrid model the Mamba groups dominate offload storage -- 76 of
+# the 78.7 MiB of real payload per 3584-token chunk here -- because offload
+# snapshots recurrent state at EVERY chunk boundary while the live GPU pool keeps
+# only the current state per request. That is why offload cannot reach pool
+# parity by layout work alone.
+#
+# WHY IT IS SAFE TO SPARSIFY: vLLM already treats a Mamba group as a
+# sliding-window group of exactly ONE chunk ("Mamba depends on a single state",
+# get_sliding_window_size_in_chunks), so _sliding_window_lookup scans from the
+# END for a single hit -- it never needs the interior chunks. And
+# _lookup_complete_chunks already rounds the hit window DOWN to
+# _mamba_align_size, so a hit can be forced to land exactly where a snapshot
+# exists. Setting alignment_chunk_count=K makes the existing, tested
+# is_store_reachable_swa_chunk keep only the last chunk of each K-segment
+# (position_in_segment >= actual_segment_length - 1 with a reachable_tail of 1).
+#
+# THE TRADE: a restore rounds down to a multiple of K chunks, so up to
+# (K-1) * tokens_per_chunk tokens are re-prefilled. Stored rows per chunk go from
+# 1 + n_mamba to 1 + n_mamba/K, which is what widens the restore window:
+# K=2 -> 1.67x, K=4 -> 2.5x, K=8 -> 3.33x on this model.
+#
+# Both halves MUST move together. Storing 1-in-K without widening the alignment
+# would let a hit land on an unstored boundary and restore attention KV with no
+# matching recurrent state -- silent wrong output. Guarded by one knob:
+# GLM53_OFFLOAD_MAMBA_SNAPSHOT_CHUNKS (default 1 = upstream behaviour).
+MAMBA_ALIGN_OLD = """    mamba_align_size: int | None = None
+    for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+"""
+MAMBA_ALIGN_NEW = """    import os as _os
+
+    # LOCAL [glm53-offload-nonshareable]: see the patch docstring -- widen the
+    # hit-window alignment by the snapshot interval so a hit can only land on a
+    # boundary where a Mamba snapshot was actually stored.
+    _snap = max(1, int(_os.environ.get("GLM53_OFFLOAD_MAMBA_SNAPSHOT_CHUNKS", "1")))
+    mamba_align_size: int | None = None
+    for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+"""
+# Unique to THIS edit: the env var name alone also appears in the knob edit
+# below, so using it here would depend on list order to apply at all.
+MAMBA_ALIGN_SENTINEL = "_snap = max(1, int("
+
+MAMBA_RET_OLD = """            assert mamba_align_size is None or mamba_align_size == tokens_per_chunk
+            mamba_align_size = tokens_per_chunk
+    return mamba_align_size
+"""
+MAMBA_RET_NEW = """            assert mamba_align_size is None or mamba_align_size == tokens_per_chunk
+            mamba_align_size = tokens_per_chunk
+    if mamba_align_size is not None and _snap > 1:
+        mamba_align_size *= _snap
+    return mamba_align_size
+"""
+MAMBA_RET_SENTINEL = "mamba_align_size *= _snap"
+
+MAMBA_STORE_OLD = """                    alignment_chunk_count=_alignment_chunk_count(
+                        tokens_per_block * spec.blocks_per_chunk, sw
+                    ),
+"""
+MAMBA_STORE_NEW = """                    alignment_chunk_count=(
+                        # LOCAL [glm53-offload-nonshareable]: keep only the last
+                        # chunk of each K-segment for Mamba state; the hit window
+                        # is widened to match in resolve_mamba_align_size.
+                        _mamba_snapshot_chunks
+                        if (
+                            _mamba_snapshot_chunks > 1
+                            and isinstance(kv_spec, MambaSpec)
+                        )
+                        else _alignment_chunk_count(
+                            tokens_per_block * spec.blocks_per_chunk, sw
+                        )
+                    ),
+"""
+# Unique to THIS edit: "_mamba_snapshot_chunks" alone is introduced by the
+# knob edit above, so using it here silently skipped this edit entirely.
+MAMBA_STORE_SENTINEL = "chunk of each K-segment for Mamba state"
+
+MAMBA_KNOB_OLD = """        eagle_groups = {
+            idx
+            for idx, g in enumerate(kv_cache_config.kv_cache_groups)
+            if g.is_eagle_group
+        }
+"""
+MAMBA_KNOB_NEW = """        import os as _os2
+
+        _mamba_snapshot_chunks = max(
+            1, int(_os2.environ.get("GLM53_OFFLOAD_MAMBA_SNAPSHOT_CHUNKS", "1"))
+        )
+        if _mamba_snapshot_chunks > 1:
+            logger.info(
+                "KV offloading: snapshotting Mamba state every %d chunks "
+                "(hit window rounds down to match). Cuts offload storage on "
+                "hybrid models; costs up to %d-1 chunks of re-prefill.",
+                _mamba_snapshot_chunks,
+                _mamba_snapshot_chunks,
+            )
+
+        eagle_groups = {
+            idx
+            for idx, g in enumerate(kv_cache_config.kv_cache_groups)
+            if g.is_eagle_group
+        }
+"""
+MAMBA_KNOB_SENTINEL = "_mamba_snapshot_chunks = max("
+
 CONFIG_EDITS = [
     ("config:assert-filter", ASSERT_OLD, ASSERT_NEW, ASSERT_SENTINEL),
 ]
@@ -375,6 +512,14 @@ EDITS = [
     ("sched:load-skip", LOAD_OLD, LOAD_NEW, LOAD_SENTINEL),
     ("sched:hashes-clamp", CLAMP_OLD, CLAMP_NEW, CLAMP_SENTINEL),
     ("sched:small-swa-skip", SWA_OLD, SWA_NEW, SWA_SENTINEL),
+    ("sched:mamba-align-knob", MAMBA_ALIGN_OLD, MAMBA_ALIGN_NEW,
+     MAMBA_ALIGN_SENTINEL),
+    ("sched:mamba-align-widen", MAMBA_RET_OLD, MAMBA_RET_NEW,
+     MAMBA_RET_SENTINEL),
+    ("sched:mamba-snap-knob", MAMBA_KNOB_OLD, MAMBA_KNOB_NEW,
+     MAMBA_KNOB_SENTINEL),
+    ("sched:mamba-snap-store", MAMBA_STORE_OLD, MAMBA_STORE_NEW,
+     MAMBA_STORE_SENTINEL),
 ]
 
 
