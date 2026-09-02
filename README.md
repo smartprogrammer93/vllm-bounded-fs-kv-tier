@@ -77,6 +77,14 @@ is unreachable when other groups need 64.
 **Check first** — if any KV group's block size is smaller than the hash granularity,
 no offloading connector will initialise, and this tier never gets a chance to run.
 
+A **workaround needing no patch** is `--prefix-match-unit 4` (or any value dividing the
+smallest group's block size): `resolve_kv_cache_block_sizes` validates the requested unit
+only against *participating* groups, so it is accepted and the assert then passes. Note it
+multiplies stored blocks roughly 7.5×, since hashing happens at that finer granularity.
+
+A ready-to-file upstream report is in [UPSTREAM_ISSUE.md](UPSTREAM_ISSUE.md), including the
+five index-desync sites a proper fix has to touch.
+
 ## Install
 
 Put `vllm_bounded_fs_tier.py` anywhere on the engine's `PYTHONPATH` (e.g. mount it at
