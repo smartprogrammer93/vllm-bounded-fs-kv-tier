@@ -212,3 +212,40 @@ cascade returned 512 empty tokens.
   oldest-first against the same cap as a backstop.
 * Clear `/dev/shm/vllm_offload_*.mmap` before launch. vLLM never unlinks it, and
   on unified memory the orphans eventually fail the startup memory gate.
+
+## W27: cutting the offload footprint in half, twice
+
+KV that leaves the GPU pool ballooned ~7x on this deployment. Two causes, both found by
+dumping the live `/dev/shm` regions rather than reasoning about the code:
+
+`tiering/spec.py::create_worker` picks a worker's slot inside the region with
+`torch.accelerator.current_device_index() % world_size`. That equals the global rank only
+when all workers share one node. The region is one file **per node**, and with one GPU per
+host `current_device_index()` is 0 everywhere -- so every worker uses slot 0 while
+`cpu/spec.py` still sizes each row as `world_size * per-worker bytes`. Half of every row,
+and half of `cpu_bytes_to_use`, was dead. Confirmed: slot 0 populated, slot 1 all-zero on
+both hosts.
+
+* **Store only the worker's own slot** (`GLM53_OFFLOAD_RANK_LOCAL_ROWS=1`,
+  `GLM53_OFFLOAD_LOCAL_SLOT=<local device index>`) -- halves disk. Implemented by
+  narrowing the offsets the parent hands to the io helpers, so its job bookkeeping,
+  thread pool and partial-load failure handling are reused untouched.
+* **Size rows by the workers that actually share a region**
+  (`GLM53_OFFLOAD_REGION_COPIES=<GPUs per node>`, edit 7) -- doubles the blocks a given
+  `cpu_bytes_to_use` buys, and since the CPU tier bounds a restore, doubles the restore
+  window. Opt-in and clamped; setting it below the real GPUs-per-node would make
+  co-located workers share a slot and corrupt each other, so it is never defaulted.
+
+| | before | after |
+|---|---|---|
+| region row | 51.81 MiB | 25.91 MiB |
+| CPU tier blocks @ 2 GiB | 39 | **79** |
+| restore window @ 2 GiB | ~25k tokens | **~50k tokens** |
+| disk, same workload | 7.1 GB | **3.6 GB** |
+| offload cost | 75.8 KB/token | **37.6 KB/token** (6.9x -> 3.4x vs the pool) |
+
+Needle-verified after each step. A residual 1.64x remains because rows are uniform across
+groups (the MLA group's real payload is 2.48 MiB in a 25.91 MiB row); removing it needs
+ragged per-group rows. Below that lies a ~2x floor that is not a layout bug at all: Mamba
+groups snapshot recurrent state at every chunk boundary, where the live pool keeps only
+the current state per request.

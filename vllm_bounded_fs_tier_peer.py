@@ -227,9 +227,9 @@ _pclog = init_logger("vllm.peer_cascade")
 def _plog(level, msg, *args):
     """Log under the vllm.* hierarchy AND to stderr.
 
-    A logger named after this module is outside vLLM's configured logger tree
-    and its records are silently discarded -- which hid a wire-protocol bug for
-    a whole engine boot. Never let a cascade failure be invisible.
+    A logger named after this module sits outside vLLM's configured logger tree
+    and every record is dropped, which hid a wire-protocol bug for a whole
+    engine boot. Never let a cascade failure be invisible.
     """
     try:
         getattr(_pclog, level)(msg, *args)
@@ -344,8 +344,25 @@ class PeerMirroredFileSystemTierManager(BoundedFileSystemTierManager):
         self._held: list = []
         self._peer_lock = threading.Lock()
         self._load_keys_mirror: dict = {}
+        # 0 => "not decided yet"; _used_bytes() falls back to the row size.
+        # The parent's constructor calls _used_bytes() (via its startup log and
+        # _evict_if_needed), so this must exist before super().__init__().
+        self._on_disk_block_bytes = 0
 
         super().__init__(*args, **kwargs)
+
+        # W27b geometry: a region row spans every rank
+        # (_worker_offset = rank * cpu_page_size), but a rank's worker only ever
+        # touches its own sub-slot.
+        _spec = getattr(self, "_offloading_spec", None)
+        _par = getattr(getattr(_spec, "config", None), "parallel", None)
+        self._page_size = int(getattr(_spec, "cpu_page_size_per_worker", 0) or 0)
+        self._rank = int(getattr(_par, "rank", 0) or 0)
+        self._world = int(getattr(_par, "world_size", 1) or 1)
+        if (os.environ.get("GLM53_OFFLOAD_RANK_LOCAL_ROWS", "1") == "1"
+                and self._world > 1
+                and 0 < self._page_size < self._block_size):
+            self._install_rank_local_io()
 
         addrs = [a.strip() for a in peers_env.split(",") if a.strip()]
         for i, a in enumerate(addrs):
@@ -364,6 +381,10 @@ class PeerMirroredFileSystemTierManager(BoundedFileSystemTierManager):
             "o_direct": bool(getattr(self, "_use_o_direct", False)),
             # The one configurable bound (max_bytes) governs every rank's copy.
             "max_bytes": int(self._max_bytes),
+            # W27b: 0 => peer writes whole rows (legacy), >0 => its own slice.
+            "page_size": int(self._page_size) if self._on_disk_block_bytes
+            != self._block_size else 0,
+            "local_slot": int(os.environ.get("GLM53_OFFLOAD_LOCAL_SLOT", "0")),
         }
         for p in self._peers:
             p.set_hello(hello)
@@ -374,10 +395,72 @@ class PeerMirroredFileSystemTierManager(BoundedFileSystemTierManager):
             thread_name_prefix="peer-cascade")
         _plog("info",
               "%d peer rank(s) %s; basename=%s block_size=%d region=%d bytes "
-              "cap=%.2f GiB",
+              "cap=%.2f GiB local_slot_page=%s",
               len(self._peers), [p.addr for p in self._peers],
               hello["basename"], hello["block_size"], hello["total_size"],
-              hello["max_bytes"] / 1024 ** 3)
+              hello["max_bytes"] / 1024 ** 3, hello["page_size"] or "off")
+
+    # -- W27b: store only this rank's sub-slot of each row ----------------
+    def _install_rank_local_io(self) -> None:
+        """Halve offload storage by writing only this rank's slice of a row.
+
+        Each rank's cascade otherwise writes the ENTIRE row, including the other
+        rank's half, which is inert on this host -- and the peer writes the same
+        row from its side, so every byte lands on disk twice. Narrowing the
+        offsets and length the parent passes to the io helpers fixes that while
+        reusing all of the parent's job bookkeeping, thread pool and partial-load
+        failure handling untouched.
+
+        Offsets stay O_DIRECT-aligned: cpu_page_size_per_worker is itself a
+        multiple of the page size, so base and length are too.
+        """
+        import vllm.v1.kv_offload.tiering.fs.manager as _fsm
+
+        if getattr(_fsm, "_glm53_rank_local_io", None) is not None:
+            self._on_disk_block_bytes = _fsm._glm53_rank_local_io[1]
+            return
+        # MEASURED, do not "fix" this to rank * page: with one worker per node
+        # each node has its OWN region, so the worker's slot index within that
+        # region is its LOCAL rank -- 0 on every host. Dumping both regions
+        # showed slot 0 populated and slot 1 all-zero on BOTH ranks, i.e. the
+        # upper half of every row is dead padding here (cpu/spec.py sizes the row
+        # by world_size even when the region is not shared across those ranks).
+        # Using rank * page made the peer store and restore zeros -> silent
+        # corruption (empty completions), which is how this was found.
+        page = self._page_size
+        base = int(os.environ.get("GLM53_OFFLOAD_LOCAL_SLOT", "0")) * page
+        _orig_store = _fsm.batch_store_block
+        _orig_load = _fsm.batch_load_block
+
+        def _store(paths, view, offsets, block_size, use_o_direct=True):
+            return _orig_store(
+                paths, view, [o + base for o in offsets], page, use_o_direct)
+
+        def _load(paths, view, offsets, block_size, use_o_direct=True):
+            # Preserves the OSError.num_succeeded contract by forwarding as-is.
+            return _orig_load(
+                paths, view, [o + base for o in offsets], page, use_o_direct)
+
+        _fsm.batch_store_block = _store
+        _fsm.batch_load_block = _load
+        _fsm._glm53_rank_local_io = (base, page)
+        self._on_disk_block_bytes = page
+        _plog("info",
+              "W27b local-slot rows ON: rank %d/%d writes [%d,%d) of each row; "
+              "on-disk block %.2f -> %.2f MiB (%.2fx less disk)",
+              self._rank, self._world, base, base + page,
+              self._block_size / 1024 ** 2, page / 1024 ** 2,
+              self._block_size / float(page))
+
+    def _used_bytes(self) -> int:
+        """Account for what is actually on disk, so max_bytes stays truthful
+        (and the cap holds ~2x more blocks once rank-local rows are on).
+
+        Falls back to the full row size until the rank-local decision is made,
+        because the parent's constructor calls this before that point.
+        """
+        return len(self._tracked) * (
+            self._on_disk_block_bytes or self._block_size)
 
     # -- job mirroring ----------------------------------------------------
     def _mirror(self, op: str, job_metadata) -> None:

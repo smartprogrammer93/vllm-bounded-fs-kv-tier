@@ -151,21 +151,35 @@ check("eviction is mirrored so one max_bytes bounds every rank",
 
 print("=== 5b. construction order (regression guard) ===")
 init_src = inspect.getsource(peer_mod.PeerMirroredFileSystemTierManager.__init__)
+# Match the REAL call, not the phrase "super().__init__()" that appears in the
+# explanatory comment above the pre-super block -- searching for the short form
+# found the comment and reported a false failure.
+CALL = "super().__init__(*args, **kwargs)"
 i_peers = init_src.find("self._peers")
-i_super = init_src.find("super().__init__")
+i_super = init_src.find(CALL)
 check("_peers is assigned BEFORE super().__init__ -- the bounded parent's "
       "constructor calls _evict_if_needed(), which our override reads it in",
       i_peers != -1 and i_super != -1 and i_peers < i_super,
       f"peers@{i_peers} super@{i_super}")
+# Every attribute any override reads must exist before super().__init__(),
+# because the bounded parent's constructor calls _evict_if_needed() AND
+# _used_bytes(). Missing _on_disk_block_bytes from this list already cost one
+# failed boot.
 for attr in ("_pool_exec", "_pending", "_held", "_peer_lock",
-             "_load_keys_mirror"):
+             "_load_keys_mirror", "_on_disk_block_bytes"):
     idx = init_src.find("self." + attr)
     check(f"{attr} assigned before super().__init__",
-          idx != -1 and idx < i_super, f"{attr}@{idx}")
+          idx != -1 and 0 <= idx < i_super, f"{attr}@{idx} call@{i_super}")
 bounded_init = inspect.getsource(peer_mod.BoundedFileSystemTierManager.__init__)
 check("the parent constructor really does call _evict_if_needed "
       "(this is why the ordering matters)",
       "_evict_if_needed" in bounded_init)
+check("the parent constructor also calls _used_bytes, which our override "
+      "reads _on_disk_block_bytes in",
+      "_used_bytes" in bounded_init)
+check("_used_bytes tolerates the pre-super sentinel",
+      "or self._block_size" in inspect.getsource(
+          peer_mod.PeerMirroredFileSystemTierManager._used_bytes))
 
 print("=== 6. agent: eviction confinement and backstop sweep ===")
 with tempfile.TemporaryDirectory() as td:

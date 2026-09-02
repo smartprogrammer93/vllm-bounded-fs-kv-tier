@@ -136,8 +136,10 @@ class Region:
             finally:
                 os.close(fd)
             self.view = memoryview(self.mm)
-            log("attached region %s (%d bytes, rank=%s, block_size=%s)"
-                % (self.path, want, cfg["rank"], cfg["block_size"]))
+            log("attached region %s (%d bytes, rank=%s, block_size=%s, "
+                "rank_local_page=%s)"
+                % (self.path, want, cfg["rank"], cfg["block_size"],
+                   cfg.get("page_size") or "off"))
             return self.path
 
     def path_for(self, key_hex: str, group_idx: int) -> str:
@@ -251,11 +253,26 @@ def handle(msg: dict) -> dict:
 
     block_size = int(cfg["block_size"])
     o_direct = bool(cfg.get("o_direct", False))
+    # W27b: a row spans every rank, but this rank's worker only touches its own
+    # sub-slot -- so store/load just that slice instead of the whole row, which
+    # otherwise puts the head's inert half on this host's disk as well.
+    page = int(cfg.get("page_size") or 0)
+    if page > 0:
+        span = page
+        # Slot 0, NOT rank * page. Each node has its own region with a single
+        # worker, so that worker's slot index within it is its LOCAL rank (0).
+        # Verified by dumping both regions: slot 0 populated, slot 1 all-zero on
+        # both hosts. Using rank * page here stored and restored zeros for this
+        # rank -- a silent-corruption bug (empty completions).
+        base = int(cfg.get("local_slot", 0)) * page
+    else:
+        span = block_size
+        base = 0
     paths, offsets = [], []
     for key_hex, bid in zip(msg["keys"], msg["block_ids"]):
         h, g = split_key(key_hex)
         paths.append(REGION.path_for(h, g))
-        offsets.append(int(bid) * block_size)
+        offsets.append(int(bid) * block_size + base)
 
     if op == "store":
         for p in paths:
@@ -264,7 +281,7 @@ def handle(msg: dict) -> dict:
     fn = ((batch_store_block if op == "store" else batch_load_block)
           if _HAVE_VLLM_IO else (_py_store if op == "store" else _py_load))
     try:
-        fn(paths, REGION.view, offsets, block_size, o_direct)
+        fn(paths, REGION.view, offsets, span, o_direct)
     except OSError as e:
         return {"ok": False, "job_id": msg.get("job_id"),
                 "num_succeeded": int(getattr(e, "num_succeeded", 0)),

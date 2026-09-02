@@ -91,6 +91,7 @@ from pathlib import Path
 VLLM = Path("/usr/local/lib/python3.12/dist-packages/vllm")
 SCHED = VLLM / "distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py"
 CONFIG = VLLM / "distributed/kv_transfer/kv_connector/v1/offloading/config.py"
+CPUSPEC = VLLM / "v1/kv_offload/cpu/spec.py"
 
 MARK = "[glm53-offload-nonshareable]"
 
@@ -323,8 +324,49 @@ SWA_SENTINEL = "GLM53_OFFLOAD_SKIP_SMALL_SWA"
 
 W27A_SENTINEL = "KV offloading [W27a]"
 
+
+# --- edit 7: region rows are sized for world_size copies but only one is used -
+# The CPU offload region is ONE FILE PER NODE
+# (/dev/shm/vllm_offload_<engine_id>.mmap) and a worker's slot index inside it is
+#     rank = torch.accelerator.current_device_index() % world_size
+# (tiering/spec.py::create_worker). That is only the global rank when every
+# worker sits on one node. On a multi-node TP group with one GPU per host,
+# current_device_index() is 0 everywhere, so EVERY worker uses slot 0 and the
+# remaining world_size-1 slots of every row are never written.
+#
+# Verified by dumping both regions on a 2-node TP=2 pair: slot 0 populated,
+# slot 1 all-zero on BOTH hosts. Since cpu/spec.py still sizes each row as
+# world_size * per-worker bytes, (world_size-1)/world_size of cpu_bytes_to_use
+# is dead -- half of it here. Making num_copies the number of workers that
+# actually SHARE a region doubles the blocks a given cpu_bytes_to_use buys, and
+# the CPU tier is what bounds a restore, so it doubles the restore window.
+#
+# Opt-in and clamped: GLM53_OFFLOAD_REGION_COPIES=<n>, unset = upstream
+# behaviour. Set it to the number of GPUs per node. Setting it BELOW that would
+# make co-located workers share one slot and corrupt each other, so it is not
+# defaulted.
+COPIES_OLD = """            num_copies = 1 if self.replicated_layout else world_size
+"""
+COPIES_NEW = """            num_copies = 1 if self.replicated_layout else world_size
+            # LOCAL [glm53-offload-nonshareable]: see the patch docstring --
+            # the region is per-node and the slot index is the LOCAL device
+            # index, so rows sized by world_size waste
+            # (world_size-1)/world_size of cpu_bytes_to_use on a multi-node TP
+            # group. Must equal the number of workers sharing one region.
+            import os as _os
+
+            _copies_env = _os.environ.get("GLM53_OFFLOAD_REGION_COPIES")
+            if _copies_env and not self.replicated_layout:
+                num_copies = max(1, min(int(_copies_env), world_size))
+"""
+COPIES_SENTINEL = "GLM53_OFFLOAD_REGION_COPIES"
+
 CONFIG_EDITS = [
     ("config:assert-filter", ASSERT_OLD, ASSERT_NEW, ASSERT_SENTINEL),
+]
+
+CPUSPEC_EDITS = [
+    ("cpuspec:region-copies", COPIES_OLD, COPIES_NEW, COPIES_SENTINEL),
 ]
 
 EDITS = [
@@ -370,6 +412,7 @@ def main() -> int:
         return 0
     print(f"{MARK} {apply_edits(SCHED)}")
     print(f"{MARK} {apply_edits(CONFIG, CONFIG_EDITS)}")
+    print(f"{MARK} {apply_edits(CPUSPEC, CPUSPEC_EDITS)}")
     return 0
 
 
