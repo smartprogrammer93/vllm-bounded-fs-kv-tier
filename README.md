@@ -51,10 +51,11 @@ Storage, after the layout fixes:
 |---|---|
 | `vllm_bounded_fs_tier.py` | Both tier managers: `BoundedFileSystemTierManager` (byte cap + LRU) and `PeerMirroredFileSystemTierManager` (per-rank cascade, own-slot writes) |
 | `peer_kv_agent.py` | Runs in each remote rank's container; performs that rank's own cascade and promotion against its own region and `_r<rank>` files |
-| `patch_offload_nonshareable_groups.py` | Seven idempotent, sentinel-guarded source edits, gated on `GLM53_OFFLOAD_GROUP_FILTER=1`, fail-closed if upstream drifts |
+| `patch_offload_nonshareable_groups.py` | Idempotent, sentinel-guarded source edits (seven applied, plus an opt-in experiment knob), gated on `GLM53_OFFLOAD_GROUP_FILTER=1`, fail-closed if upstream drifts |
 | `tests/` | Contract checks against the real vLLM classes, so an engine upgrade fails here rather than silently corrupting KV |
+| `probes/` | The Mamba-necessity experiment and its offline unit tests |
 
-## The seven patch edits
+## The patch edits
 
 1–3. Drop `participates_in_prefix_caching == False` groups from the offload lookup, store
 and load sets — mirroring what `KVCacheCoordinator.verify_and_split_kv_cache_groups`
@@ -111,14 +112,11 @@ still occupies a 25.91 MiB row. Removing it needs ragged per-group rows across
 `config.py`, `cpu/spec.py`, `shared_offload_region.py` and the CPU worker's offset
 arithmetic.
 
-Below that sits a **~2× floor that is not a layout bug**: on this hybrid model the four
-Mamba groups account for ~76 of 78.7 MiB per chunk, because offload snapshots recurrent
-state at *every chunk boundary* while the live pool keeps only the current state per
-request. Parity with the pool is therefore not reachable by layout work alone.
-
-## Licence
-
-Apache-2.0. Not affiliated with the vLLM project.
+Below that, the four Mamba groups account for ~76 of the 78.7 MiB of real payload per
+chunk, because offload snapshots recurrent state at *every* chunk boundary while the live
+pool keeps only the current state per request. That looked like a hard ~2× floor over the
+pool — but the probe below suggests it may not be a floor at all, so treat the 2× figure as
+an upper bound pending the follow-ups listed there.
 
 ## Open question: is the Mamba recurrent state needed at all?
 
@@ -147,3 +145,7 @@ An exact-match oracle was tried first and rejected: greedy output is not bit-rep
 across differing prefill paths, so it flagged noise as corruption. `probes/` includes the
 offline unit tests (22 checks) for the probe's placement, scoring, metrics parsing and
 verdict logic — a live iteration here costs ~15 minutes, an offline one milliseconds.
+
+## Licence
+
+Apache-2.0. Not affiliated with the vLLM project.
