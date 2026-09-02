@@ -125,55 +125,197 @@ full-attention groups.
 
 ---
 
-# Second defect: the offload read path never produces a hit (write-only offloading)
+# Second defect: non-shareable KV groups cap every offload hit at 0
 
 Same build and model. After working around the assert above with
-`--prefix-match-unit 4`, offloading initialises and **stores work**, but **no load ever
-happens**:
+`--prefix-match-unit 4`, offloading initialises and **stores work**, but no load
+ever happens:
 
 ```
-vllm:kv_offload_total_bytes_total{transfer_type="GPU_to_CPU"} = 1.0097721344e+10   # 10 GB
-vllm:kv_offload_total_bytes_total{transfer_type="CPU_to_GPU"} = 0.0                # always
+vllm:kv_offload_total_bytes_total{...,transfer_type="GPU_to_CPU"} = 1.18e+10   # 11.8 GB
+vllm:kv_offload_total_bytes_total{...,transfer_type="CPU_to_GPU"} = 0.0        # always
+vllm:kv_offload_tiering_block_hits_total{...,tier="1:..."}        = 0          # always
 ```
 
-## What was ruled out
+Every request re-prefills in full (`cached_tokens=0`).
 
-Each of these was eliminated with a separate run, and the result never changed:
+## Root cause
 
-| possibility | how it was excluded |
-|---|---|
-| blocks evicted before reuse | disk cap raised to 100 GiB; 22 GB of blocks present, **no eviction** |
-| non-deterministic block hashes | `PYTHONHASHSEED=0` verified with `docker exec printenv` |
-| lookups disabled for the request | `skip_reading_prefix_cache` is only set when `prompt_logprobs` is used; the same requests **do** get GPU prefix-cache hits |
-| empty lookup group set | `_lookup_groups` = full-attention + sliding-window = all 7 groups |
-| draft/EAGLE volatility exclusion | reproduced with `SPEC_METHOD=none`, log shows `EAGLE lines: 0` |
-| CPU-tier allocation failure | `cpu_bytes_to_use` raised until `kv_offload_allocation_failure` stopped and stores succeeded |
-| memory starvation | MemAvailable 18.2–18.4 GiB stable for the whole run |
-| async lookup needing a prime, then masked by the GPU prefix cache | two-eviction-cycle test below |
+`OffloadingConnectorScheduler.__init__` puts **every** KV cache group into the
+lookup set:
 
-## The async-priming test (the strongest check)
-
-`FileSystemTierManager` looks up through `FsAsyncLookupManager`, so a first
-post-eviction request might only prime the lookup — and because that request
-repopulates the GPU prefix cache, an immediate repeat is served by APC and never
-consults offload. To defeat that masking, s0 was evicted **twice**:
-
-```
-s0 cold (seed)      TTFT=27.66s  cached=0/15494  CPU_to_GPU +0.0 MiB
-[11 filler sessions -> s0 evicted from a 168,521-token pool]
-attempt A (prime)   TTFT=21.33s  cached=0/15494  CPU_to_GPU +0.0 MiB
-[11 more fillers -> s0 evicted again]
-attempt B (primed)  TTFT=15.65s  cached=0/15494  CPU_to_GPU +0.0 MiB
+```python
+full_attention_groups: list[int] = []
+sliding_window_groups: list[int] = []
+for group_config in self.config.kv_group_configs:     # <-- unfiltered
+    ...
+self._lookup_groups = tuple(full_attention_groups) + self._sliding_window_groups
 ```
 
-Full prefill each time, `cached_tokens=0`, zero bytes read back.
+and `_lookup_complete_chunks` bails out as soon as *any* queried group reports
+no hit chunks:
 
-## Impact
+```python
+if num_hit_chunks == 0:
+    return 0
+```
 
-Offloading is effectively write-only: it consumes CPU memory, disk and write bandwidth
-while never serving a read, so it is a pure cost. On a unified-memory machine (NVIDIA GB10)
-that is actively harmful, because the CPU tier is taken from the same pool as weights and
-KV.
+A group whose spec sets `participates_in_prefix_caching = False` holds nothing
+shareable between requests, so it can never report a hit — and therefore caps
+every lookup at 0.
 
-Happy to run further diagnostics — instrumenting `_lookup_complete_chunks` to log the
-looked-up vs stored keys would be the obvious next step, but that needs a debug build.
+vLLM core already knows this. `KVCacheCoordinator.verify_and_split_kv_cache_groups`:
+
+```python
+# Skip groups that opt out of prefix caching (e.g. GLM5Next's kpool
+# tail): their blocks are per-request scratch, never shareable, so they
+# must not participate in hit lookup (their manager-level hooks already
+# no-op). Their slot in the per-group hit tuple stays empty.
+if not g.kv_cache_spec.participates_in_prefix_caching:
+    continue
+```
+
+and `KpoolTailSpec.participates_in_prefix_caching` names this exact failure as
+the reason the property exists:
+
+```python
+# Exclude it from the structural prefix-caching machinery so it neither
+# drags the global block size down to ``kpool`` nor CAPS THE HYBRID HIT AT 0.
+```
+
+The offloading connector's hit lookup is the third consumer that
+`KVCacheSpec.participates_in_prefix_caching`'s own docstring says must apply the
+filter ("the global `cache_config.block_size` min, the hybrid divisibility
+assert, and the `attention_groups` hit-lookup"). It applies neither this filter
+nor the one in defect 1.
+
+## Evidence
+
+GLM-5.3-Flash has six groups; ours reports:
+
+```
+managers=[('FullAttentionManager', 3328, True), ('KpoolTailManager', 4, False),
+          ('MambaManager', 3328, True) x4]        # (name, block_size, participates)
+```
+
+Group 1 is the scratch group. Counting the files the FS tier wrote, per group
+directory (`..._g<idx>/`), after 15 requests:
+
+| group | manager | participates | files stored |
+|---|---|---|---|
+| 0 | FullAttention | True | 47 |
+| **1** | **KpoolTail** | **False** | **2** |
+| 2-5 | Mamba | True | 47 each |
+
+Group 1 is queried on every lookup and has essentially nothing to return, so
+`_lookup_complete_chunks` returns 0 every time.
+
+## Fix
+
+Mirror core, in three places. Note that `_lookup_groups` /
+`_sliding_window_groups` hold group *indices*, so omitting an index disturbs no
+positional layout — `OffloadingConfig.groups` must be left intact (see the
+warning below).
+
+1. `__init__` — record the non-shareable groups, drop them from
+   `_lookup_groups` / `_sliding_window_groups`.
+2. store collection in `build_connector_meta` — skip their chunks. Nothing can
+   look them up, so storing them is pure cost. The downstream per-group loop is
+   driven by `keys_to_store` membership and emits `group_sizes.append(0)` for
+   them on its own.
+3. `update_state_after_alloc` — do not request their keys on load (never
+   stored => guaranteed miss) and append `0` to `group_sizes` / `block_indices`
+   so the worker's positional lists stay aligned.
+   `CPUGPUOffloadingWorker._transfer` already short-circuits
+   `if group_size == 0: continue`, and its `src_offset == num_src_blocks` /
+   `dst_offset == num_dst_blocks` asserts still balance because no block ids are
+   contributed either.
+
+### Do NOT filter `OffloadingConfig.groups`
+
+Our first attempt did, and it desynchronises at least five positional consumers:
+`file_mapper.py` (`_g<group_idx>` path), `offloading/base.py`
+(`tokens_per_block`), `scheduler.resolve_mamba_align_size`
+(`kv_cache_groups[idx]`), the worker's per-group `CanonicalKVCacheRef` lists, and
+`cpu/gpu_worker.py`'s `assert len(group_sizes) == len(self.layer_refs_per_group)`.
+Core also hands the connector per-group block-id tuples covering every group
+(`assert len(new_block_id_groups) == len(self.group_states)`).
+
+### One caveat worth checking upstream
+
+`_lookup_complete_chunks` applies the mamba hit-window alignment only inside
+`if self._sliding_window_groups:`. On GLM-5.3-Flash the scratch group is the only
+`SlidingWindowSpec`, so filtering it empties that tuple and the `round_down` to
+`_mamba_align_size` stops running. It is harmless here because every remaining
+group has `tokens_per_chunk == 3328`, which makes the hit naturally aligned, but
+the alignment looks like it should be gated on `_mamba_align_size is not None`
+rather than on the presence of sliding-window groups.
+
+## Result
+
+With the fix, on the same probe (seed a 15,523-token session, evict it with 14
+larger sessions, re-send it):
+
+| | before | after |
+|---|---|---|
+| `cached_tokens` on re-send | 0 | **13,312** |
+| `CPU_to_GPU` bytes | 0 | **349 MB** |
+| `tiering_block_hits{tier=fs}` | 0 | **8** |
+| wall time | 16.26 s | **5.63 s** |
+
+13,312 == 4 x 3328, i.e. every complete chunk of the prompt was restored.
+
+---
+
+# Third defect: a secondary tier silently corrupts KV when the TP group spans nodes
+
+This one produces **wrong output with no error**, so it matters more than the
+other two.
+
+`FileSystemTierManager` is constructed with a memoryview of the *primary* CPU
+tier (`tiering/spec.py`: `primary_kv_view = primary_tier.get_kv_memoryview()`),
+and both directions operate on it alone:
+
+```python
+def submit_store(self, job_metadata):        # CPU -> disk
+    task = functools.partial(batch_store_block, paths, self._primary_kv_view, ...)
+def submit_load(self, job_metadata):         # disk -> CPU
+    batch_load_block(paths, self._primary_kv_view, ...)
+```
+
+That CPU tier is a per-node `/dev/shm` mmap
+(`shared_offload_region.py`: `Created mmap file /dev/shm/vllm_offload_<engine_id>.mmap`),
+and the secondary tier is instantiated **scheduler-side only** — in EngineCore
+and the API server, never in the workers.
+
+So when a tensor-parallel group spans hosts (`--nnodes 2`, one `vllm serve`
+process per node):
+
+* rank 0's shard is cascaded CPU -> disk and promoted disk -> CPU normally;
+* rank 1's CPU region is on the other host and is never touched by any FS tier;
+* the scheduler nonetheless tracks one logical block set and issues the load to
+  every worker (`pending_count = num_workers`);
+* each worker copies CPU -> GPU from **its own** region, so rank 1 copies
+  whatever stale bytes occupy those slots.
+
+The request is then marked as having a valid cached prefix while half the heads
+hold garbage. Measured on our pair: the restore reported `cached_tokens=13312`
+and completed in 5.63 s instead of 16.26 s, and the model emitted 512
+consecutive tokens of neither `content` nor `reasoning_content` — the same
+prompt answers correctly on a cold prefill and on a GPU prefix-cache hit.
+Confirmation that only one rank participates:
+
+```
+head   : 15 GB under kvoffload/, directories ..._r0/...
+worker : kvoffload/ empty, 0 files
+```
+
+`replicated_layout` in `offloading/config.py` already refuses to engage when
+`parallel_config.nnodes_within_dp != 1`, with the comment "Shared /dev/shm mmap
+layout is single-node mp only" — so the single-node assumption is understood in
+one place but not enforced where it silently changes results.
+
+**Suggested fix:** refuse to configure a secondary tier when the KV-parallel
+group spans nodes (fail closed at startup), or instantiate the tier per rank so
+each cascades its own CPU region. A CPU-only tier is unaffected, because the
+scheduler drives every rank's region symmetrically.

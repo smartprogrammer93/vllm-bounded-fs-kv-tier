@@ -147,3 +147,31 @@ restart adoption.
 ## License
 
 Apache-2.0, matching vLLM.
+
+## Also here: a fix for the offload read path
+
+`patch_offload_nonshareable_groups.py` fixes a vLLM bug that makes KV offloading
+**write-only** on any model with a KV cache group whose spec sets
+`participates_in_prefix_caching = False` (GLM5Next's `KpoolTailSpec`, for
+example). Such a group holds per-request scratch and can never report a
+prefix hit, but `OffloadingConnectorScheduler` still queries it, and
+`_lookup_complete_chunks` returns 0 as soon as any queried group misses. Result:
+stores succeed, `CPU_to_GPU` stays at exactly 0 forever, and every request
+re-prefills in full.
+
+The patch mirrors what vLLM core already does in
+`KVCacheCoordinator.verify_and_split_kv_cache_groups`. Measured on
+GLM-5.3-Flash (TP=2), re-sending a 15.5k-token session after evicting it:
+
+| | before | after |
+|---|---|---|
+| `cached_tokens` | 0 | 13,312 |
+| `CPU_to_GPU` | 0 B | 349 MB |
+| TTFT | 15.5 s | 2.5 s (**6.0-6.3x**) |
+
+Answers verified against a per-session needle, with no cross-session
+contamination.
+
+See `UPSTREAM_ISSUE.md` for the full analysis, including a third defect: a
+secondary (disk) tier **silently corrupts KV when the tensor-parallel group
+spans hosts**, because the tier only ever touches the local node's CPU region.
