@@ -53,7 +53,7 @@ Storage, after the layout fixes:
 | `peer_kv_agent.py` | Runs in each remote rank's container; performs that rank's own cascade and promotion against its own region and `_r<rank>` files |
 | `patch_offload_nonshareable_groups.py` | Idempotent, sentinel-guarded source edits (seven applied, plus an opt-in experiment knob), gated on `GLM53_OFFLOAD_GROUP_FILTER=1`, fail-closed if upstream drifts |
 | `tests/` | Contract checks against the real vLLM classes, so an engine upgrade fails here rather than silently corrupting KV |
-| `probes/` | The Mamba-necessity experiment and its offline unit tests |
+| `probes/` | The Mamba-necessity experiment, the W28 device-addressability gate, and offline unit tests |
 
 ## The patch edits
 
@@ -146,6 +146,33 @@ bit-reproducible across differing prefill paths, so it flagged noise as corrupti
 `probes/` includes offline unit tests (22 checks) for the probe's placement, scoring,
 metrics parsing and verdict logic — a live iteration here costs ~15 minutes, an offline one
 milliseconds.
+
+## Why the CPU staging tier cannot be removed on this hardware
+
+The obvious optimisation is to skip the CPU tier entirely: a KV block is scattered across
+per-layer tensors, but `pwritev`/`preadv` take an iovec, so the gather could go straight
+from the KV pages into one file — removing the staging copy, the uniform-row padding, and
+the restore-window cap in one move.
+
+`probes/w28_gate.py` tests whether that is possible. On GB10 it is not:
+
+```
+environment -- torch 2.13.0+cu130 | NVIDIA GB10 | cc 12.1 | unified=1
+CPU read of t.data_ptr()  -> SIGSEGV
+pwritev from device ptr   -> OSError [Errno 14] Bad address
+preadv  into device ptr   -> OSError [Errno 14] Bad address
+```
+
+The device reports itself as integrated and the memory is genuinely coherent, which makes
+"it already lives in host RAM" sound right. It isn't: a `cudaMalloc` allocation is not
+mapped into the host page tables, so the CPU cannot dereference it and the kernel rejects
+it for I/O. **Coherent is not the same as host-addressable.** The GPU→CPU hop is therefore
+not a redundant copy on unified memory — it is the only way to obtain bytes the kernel can
+address.
+
+The remaining door is allocating the KV pool as managed/pinned memory, which *is*
+host-addressable — but that changes how vLLM allocates the cache itself and needs its own
+performance gate. GPUDirect Storage is separately impossible here (no BAR1).
 
 ## Licence
 
