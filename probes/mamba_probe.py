@@ -172,6 +172,58 @@ for i in range(1, NFILL + 1):
 print("      done", flush=True)
 time.sleep(10)
 
+TURNS = int(os.environ.get("TURNS", "1"))
+
+
+def ask_multi(text, seed, label):
+    """Continue a restored session for TURNS turns, scoring recall each turn.
+
+    Drift is the failure mode a single-turn needle probe cannot see: if the
+    recurrent state were actually needed, error should COMPOUND as the
+    conversation grows on top of the restored prefix. Recall holding flat across
+    turns is the evidence that it does not.
+    """
+    msgs = [{"role": "user", "content": text + "\n\n" + Q}]
+    scores = []
+    for t in range(TURNS):
+        body = {"model": MODEL, "messages": msgs, "temperature": 0,
+                "max_tokens": MAXTOK, "stream": True,
+                "stream_options": {"include_usage": True},
+                "chat_template_kwargs": {"reasoning_effort": "low"}}
+        req = urllib.request.Request(BASE + "/v1/chat/completions",
+                                     data=json.dumps(body).encode(), headers=hdr())
+        out, usage = [], {}
+        with urllib.request.urlopen(req, timeout=1800) as r:
+            for raw in r:
+                ln = raw.decode("utf-8", "replace").strip()
+                if not ln.startswith("data: "):
+                    continue
+                c = ln[6:]
+                if c == "[DONE]":
+                    break
+                try:
+                    o = json.loads(c)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("usage"):
+                    usage = o["usage"]
+                for ch in (o.get("choices") or []):
+                    d = ch.get("delta") or {}
+                    for kk in ("content", "reasoning_content"):
+                        if d.get(kk):
+                            out.append(d[kk])
+        reply = "".join(out)
+        sc = recall(reply, seed)
+        det = usage.get("prompt_tokens_details") or {}
+        scores.append(sc)
+        print("      %s turn %d: recall=%d/%d cached=%s reply=%r"
+              % (label, t + 1, sc, NEEDLES, det.get("cached_tokens"),
+                 reply.strip()[:60]), flush=True)
+        msgs = msgs + [{"role": "assistant", "content": reply},
+                       {"role": "user", "content": Q}]
+    return scores
+
+
 print("--- 3. revisit and compare ---", flush=True)
 rows = []
 for s in seeds:
@@ -179,6 +231,12 @@ for s in seeds:
     txt, k = ask(docs[s], "session %d warm" % s)
     a = counters()
     warm = recall(txt, s)
+    if TURNS > 1:
+        turn_scores = ask_multi(docs[s], s, "session %d" % s)
+        if any(sc < NEEDLES for sc in turn_scores):
+            warm = min(warm, min(turn_scores))
+            print("      DRIFT: recall fell across turns %s" % turn_scores,
+                  flush=True)
     rows.append((s, cold[s], warm, k,
                  (a["c2g"] - b["c2g"]) / 2 ** 20, a["fs_hits"] - b["fs_hits"],
                  a["alloc_fail"] - b["alloc_fail"]))

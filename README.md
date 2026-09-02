@@ -112,39 +112,40 @@ still occupies a 25.91 MiB row. Removing it needs ragged per-group rows across
 `config.py`, `cpu/spec.py`, `shared_offload_region.py` and the CPU worker's offset
 arithmetic.
 
-Below that, the four Mamba groups account for ~76 of the 78.7 MiB of real payload per
-chunk, because offload snapshots recurrent state at *every* chunk boundary while the live
-pool keeps only the current state per request. That looked like a hard ~2× floor over the
-pool — but the probe below suggests it may not be a floor at all, so treat the 2× figure as
-an upper bound pending the follow-ups listed there.
+Below that sits a **~2× floor over the pool** that is not a layout bug: the four Mamba
+groups are ~76 of the 78.7 MiB of real payload per chunk, because offload snapshots
+recurrent state at *every* chunk boundary while the live pool keeps only the current state
+per request. Dropping those snapshots was tested and found to corrupt restores
+intermittently (see below), so the floor stands.
 
-## Open question: is the Mamba recurrent state needed at all?
+## Is the Mamba recurrent state needed for a restore? Yes — measured
 
-The Mamba groups are ~97% of the real offload payload, so this decides whether offload can
-be *cheaper* than the GPU pool rather than merely close to it. `probes/mamba_probe.py`
-answers it by excluding them and measuring recall of five needles placed inside the
-restored region:
+The Mamba groups are ~97% of the real offload payload, so dropping them would cut storage
+~5x and widen the restore window ~5x. `probes/mamba_probe.py` tests it by excluding them
+and scoring recall of five needles placed inside the restored region.
 
-| arm | Mamba offloaded | pool turnover | restored/session | disk hits | needle recall |
-|---|---|---|---|---|---|
-| B (control) | yes | 6.7x | 307 MiB | 12 | 5/5, 5/5, 5/5 |
-| A | no | 6.7x | 155 MiB | 0 | 5/5, 5/5, 5/5 |
-| A-deep | no | 18.5x | 155 MiB | 4 | 5/5, 5/5, 5/5 |
+An initial 6 sessions across two arms showed no damage at all, which looked like a large
+free win. It was underpowered. With the env plumbing corrected and a third trial:
 
-30/30 needles with the recurrent state never stored and never restored, including runs
-where the attention KV provably came off disk. If that holds up, offload lands near
-7.5 KB/token against the pool's 11 KB/token.
+| | sessions | failures |
+|---|---|---|
+| state offloaded (control) | 6 | **0** |
+| state excluded | 9 | **1** |
 
-**Deliberately not adopted.** The probe measures retrieval, not generation quality, and the
-mechanism is unknown — the state may simply be replayed from a boundary, or it may not be
-load-bearing for these reads. Enabling `GLM53_OFFLOAD_EXCLUDE_MAMBA=1` when the state *is*
-required is silent wrong output, so it stays an experiment knob until a multi-turn quality
-test and the reseed path are understood.
+The failure returned 384 tokens of neither content nor reasoning on its first restored
+request — the same degenerate signature as the multi-host KV corruption — and its later
+turns only looked healthy because the prompt was by then correctly cached in GPU.
 
-An exact-match oracle was tried first and rejected: greedy output is not bit-reproducible
-across differing prefill paths, so it flagged noise as corruption. `probes/` includes the
-offline unit tests (22 checks) for the probe's placement, scoring, metrics parsing and
-verdict logic — a live iteration here costs ~15 minutes, an offline one milliseconds.
+**Conclusion: the recurrent state is load-bearing, at least intermittently, and a needle
+probe at n=3 will miss it.** `GLM53_OFFLOAD_EXCLUDE_MAMBA` defaults to off and logs a
+warning when forced on. Any future work that sparsifies these snapshots must be validated
+at high trial count against this failure signature, not at n=3.
+
+An exact-match oracle was tried before the needle one and rejected: greedy output is not
+bit-reproducible across differing prefill paths, so it flagged noise as corruption.
+`probes/` includes offline unit tests (22 checks) for the probe's placement, scoring,
+metrics parsing and verdict logic — a live iteration here costs ~15 minutes, an offline one
+milliseconds.
 
 ## Licence
 

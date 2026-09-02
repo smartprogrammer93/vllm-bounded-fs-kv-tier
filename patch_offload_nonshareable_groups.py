@@ -294,7 +294,7 @@ SWA_OLD = """        full_attention_groups: list[int] = []
 """
 SWA_NEW = """        import os as _os
 
-        if _os.environ.get("GLM53_OFFLOAD_SKIP_SMALL_SWA", "1") == "1":
+        if (_os.environ.get("GLM53_OFFLOAD_SKIP_SMALL_SWA") or "1") == "1":
             # Mamba groups must be EXEMPT: their tokens_per_chunk equals the
             # full-attention alignment, so upstream leaves their
             # alignment_chunk_count None and they are not the fine-grained shape
@@ -328,21 +328,29 @@ SWA_NEW = """        import os as _os
                 )
             self._non_shareable_groups = self._non_shareable_groups | _small_swa
 
-            # EXPERIMENT ONLY (GLM53_OFFLOAD_EXCLUDE_MAMBA=1, default off).
-            # Mamba groups are ~97% of the real offload payload, so whether a
-            # restore actually NEEDS their recurrent state decides whether
-            # offload can ever approach pool parity. This knob excludes them so
-            # that can be measured directly. It is NOT a tuning option: if the
-            # state is needed, enabling this restores attention KV with stale
-            # recurrent state, which is silent wrong output.
+            # MEASURED UNSAFE -- default OFF (GLM53_OFFLOAD_EXCLUDE_MAMBA=1 to
+            # force it on). Mamba groups are ~97% of the real offload payload,
+            # so dropping them would cut storage ~5x and widen the restore
+            # window ~5x, and an initial probe of 6 sessions found no damage.
+            # A third trial with the plumbing fixed did: 1 of 3 sessions
+            # returned 384 tokens of neither content nor reasoning on its first
+            # restored request -- the same degenerate signature as the
+            # multi-host KV corruption. Matched control with the state offloaded:
+            # 6 sessions, 0 failures. Tally 1/9 vs 0/6.
+            #
+            # So the recurrent state IS load-bearing for a restore, at least
+            # intermittently, and a needle probe at low trial count will miss it.
+            # Anything that sparsifies or drops these snapshots must be validated
+            # at high trial count against this failure signature, not at n=3.
             if _os.environ.get("GLM53_OFFLOAD_EXCLUDE_MAMBA") == "1":
                 self._non_shareable_groups = (
                     self._non_shareable_groups | _mamba_groups
                 )
                 logger.warning(
-                    "KV offloading: EXPERIMENT -- Mamba groups %s excluded from "
-                    "offload (GLM53_OFFLOAD_EXCLUDE_MAMBA=1). If recurrent state "
-                    "is required for a restore, output will be silently WRONG.",
+                    "KV offloading: Mamba groups %s excluded from offload "
+                    "(GLM53_OFFLOAD_EXCLUDE_MAMBA=1). This is MEASURED UNSAFE: "
+                    "1 of 9 sessions returned degenerate output on its first "
+                    "restored request. Expect intermittent silent corruption.",
                     sorted(_mamba_groups),
                 )
 
