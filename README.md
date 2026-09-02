@@ -48,6 +48,35 @@ failed request. So the evictor never has to coordinate with readers.
 Tracking happens at *submit* rather than completion, which deliberately over-counts a failed
 store. That is self-healing: eviction tolerates `FileNotFoundError` and drops the entry.
 
+## Compatibility: check this before you start
+
+vLLM's offloading framework requires **every KV cache group's block size to be a multiple
+of its hash granularity** (`offloading/config.py`):
+
+```python
+tokens_per_block = group.kv_cache_spec.block_size * (dcp if AttentionSpec else 1)
+assert group.tokens_per_block % tokens_per_hash == 0
+```
+
+`tokens_per_hash` is derived by `resolve_kv_cache_block_sizes()` as an LCM-style alignment
+across groups, so it grows *away* from the smallest group rather than toward it.
+
+That makes offloading unusable for models with a **small-block compressed KV group** — for
+example a DeepSeek-V4-style sparse indexer with `compress_ratio == index_kpool == 4`, whose
+group has a 4-token block while the attention groups use 64. Observed:
+
+```
+tokens_per_block=4 not divisible by tokens_per_hash=64      # speculation on
+tokens_per_block=4 not divisible by tokens_per_hash=3328    # speculation off
+```
+
+The error suggests `--enable-prefix-caching` aligns block sizes; that is a red herring if
+prefix caching is already enabled. A 4-token group can only pass if the hash is ≤ 4, which
+is unreachable when other groups need 64.
+
+**Check first** — if any KV group's block size is smaller than the hash granularity,
+no offloading connector will initialise, and this tier never gets a chance to run.
+
 ## Install
 
 Put `vllm_bounded_fs_tier.py` anywhere on the engine's `PYTHONPATH` (e.g. mount it at
