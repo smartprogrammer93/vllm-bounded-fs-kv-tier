@@ -319,3 +319,39 @@ one place but not enforced where it silently changes results.
 group spans nodes (fail closed at startup), or instantiate the tier per rank so
 each cascades its own CPU region. A CPU-only tier is unaffected, because the
 scheduler drives every rank's region symmetrically.
+
+### We implemented the per-rank option, out-of-tree
+
+`peer_kv_agent.py` + `PeerMirroredFileSystemTierManager` (in
+`vllm_bounded_fs_tier_peer.py`) make the disk tier correct on a multi-host TP
+group without patching vLLM, using the supported out-of-tree
+`secondary_tiers[].module_path` extension point.
+
+The head-side tier mirrors every cascade and promotion to an agent running in
+each remote rank's container. The agent performs byte-identical I/O against
+*that* rank's own `/dev/shm` region and its own `_r<rank>` files —
+`FileMapper.base_path` excludes rank ("rank lives outside the hash"), so the
+shards are siblings in one namespace. Crucially the head does not release a
+job's `JobResult` until every peer has acknowledged, which keeps disk -> CPU
+ordered before CPU -> GPU on all ranks. A peer failure fails the job, so
+`mark_miss` turns it into a recompute — a wasted prefill instead of a silently
+half-restored prefix.
+
+Measured on the same probe, restores served from disk (8 FS-tier block hits per
+session, both ranks holding 220 `.bin` files / 11 GB):
+
+| session | cold TTFT | restored TTFT | speedup | cached | needle |
+|---|---|---|---|---|---|
+| 1 | 15.45 s | 2.59 s | **6.0x** | 13,312 | OK |
+| 2 | 15.57 s | 2.67 s | **5.8x** | 13,312 | OK |
+
+No cross-session contamination. Before the per-rank cascade the identical
+configuration returned 512 consecutive empty tokens.
+
+Known limitations of our workaround, all easy to lift and none affecting
+correctness: the peer's disk is unbounded (only the head tier enforces
+`max_bytes`, and a peer-side miss degrades to a recompute); each rank stores
+whole block rows, so the other rank's inert half doubles disk usage; and the CPU
+primary tier must be large enough to accept a promotion — a 4 GiB tier against a
+1 GiB GPU pool produced `kv_offload_tiering_promotion_allocation_failures_total`
+and every lookup missed, while 8 GiB worked.

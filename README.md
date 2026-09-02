@@ -175,3 +175,18 @@ contamination.
 See `UPSTREAM_ISSUE.md` for the full analysis, including a third defect: a
 secondary (disk) tier **silently corrupts KV when the tensor-parallel group
 spans hosts**, because the tier only ever touches the local node's CPU region.
+
+## And: disk offload made correct on a multi-host TP group
+
+`peer_kv_agent.py` + `PeerMirroredFileSystemTierManager` fix the third defect —
+a secondary (disk) tier silently corrupting KV when the tensor-parallel group
+spans hosts, because vLLM builds secondary tiers scheduler-side over the local
+node's CPU region only. The head-side tier mirrors every cascade and promotion
+to an agent in each remote rank's container, which does byte-identical I/O on
+its own region and its own `_r<rank>` files, and no job is released until every
+peer acknowledges — so disk -> CPU is ordered before CPU -> GPU on all ranks.
+
+Restores served from disk, needle-verified, on 2x DGX Spark (TP=2, two hosts):
+**15.5 s -> 2.6 s (5.8-6.0x)**, 13,312 tokens cached, 8 FS-tier block hits per
+session, both ranks holding their own shard. The same config without the
+cascade returned 512 empty tokens.
