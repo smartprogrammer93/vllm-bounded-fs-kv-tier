@@ -53,7 +53,7 @@ Storage, after the layout fixes:
 | `peer_kv_agent.py` | Runs in each remote rank's container; performs that rank's own cascade and promotion against its own region and `_r<rank>` files |
 | `patch_offload_nonshareable_groups.py` | Idempotent, sentinel-guarded source edits (seven applied, plus an opt-in experiment knob), gated on `GLM53_OFFLOAD_GROUP_FILTER=1`, fail-closed if upstream drifts |
 | `tests/` | Contract checks against the real vLLM classes, so an engine upgrade fails here rather than silently corrupting KV |
-| `probes/` | The Mamba-necessity experiment, the W28 addressability and managed-memory gates, and offline unit tests |
+| `probes/` | The Mamba-necessity experiment, the four W28 gates (addressability, allocator survey, VMM host access, paged bandwidth), and offline unit tests |
 
 ## The patch edits
 
@@ -147,51 +147,51 @@ bit-reproducible across differing prefill paths, so it flagged noise as corrupti
 metrics parsing and verdict logic — a live iteration here costs ~15 minutes, an offline one
 milliseconds.
 
-## Can the CPU staging tier be removed? Addressability: yes. Cost: ~9%
+## Can the CPU staging tier be removed? No — measured, after two wrong answers
 
-The big optimisation is to skip the CPU tier entirely: a KV block is scattered across
-per-layer tensors, but `pwritev`/`preadv` take an iovec, so the gather could go straight
-from the KV pages into one file — removing the staging copy, the uniform-row padding and
-the restore-window cap in one move.
+Skipping the CPU tier and gathering KV straight to disk with `pwritev`/`preadv` would
+remove the staging copy, the uniform-row padding and the restore-window cap at once. It is
+not possible on this hardware, and the reason is worth recording because two plausible
+intermediate answers were both wrong.
 
-`probes/w28_gate.py` shows this is impossible for memory from `cudaMalloc`, which is what
-the KV pool uses today:
+**1. `cudaMalloc` memory is not host-addressable** (`probes/w28_gate.py`): CPU read →
+SIGSEGV, `pwritev` → `EFAULT`. GB10 reports `is_integrated=1` and is genuinely coherent,
+which makes "it already lives in host RAM" sound right. **Coherent is not
+host-addressable.**
 
-```
-NVIDIA GB10 | cc 12.1 | is_integrated=1
-CPU read of t.data_ptr()  -> SIGSEGV
-pwritev from device ptr   -> OSError [Errno 14] Bad address
-```
+**2. Other allocations are** (`probes/w28b_gate.py`): `cudaMallocManaged` and
+`cudaHostAlloc` are host-writable, `pwritev`-able (including `O_DIRECT`) and GPU-visible;
+ATS is active so the GPU can address plain `malloc`'d memory; and
+`CUDAPluggableAllocator` can point a pool at any of them. A contiguous elementwise
+benchmark put managed memory at **0.91x** of device bandwidth, which looked like a cheap
+trade.
 
-GB10 is genuinely coherent and reports itself integrated, which makes "it already lives in
-host RAM" sound right. It isn't: a `cudaMalloc` allocation is not mapped into the host page
-tables, so the CPU cannot dereference it and the kernel rejects it for I/O. **Coherent is
-not the same as host-addressable.**
+**3. That benchmark was the wrong shape.** Decode does not stream a pool, it gathers
+scattered pages out of it. Re-measured with a random block gather
+(`probes/w28e_paged.py`), 2 GiB pool, 64 KiB blocks:
 
-But that is an allocation-policy fact, not a hardware limit. `probes/w28b_gate.py` finds
-every host-addressable option present and working: `cudaMallocManaged` is host-addressable,
-iovec-able (including `O_DIRECT`) and GPU-visible; pinned host memory likewise; the GPU can
-address plain `malloc`'d memory directly (ATS is active); and torch exposes
-`CUDAPluggableAllocator`, which is the mechanism to point a KV pool at any of them.
+| backend | paged gather | vs device |
+|---|---|---|
+| `cudaMalloc` (today) | 190–198 GB/s | 1.0x |
+| `cudaHostAlloc` (pinned) | 2.8 GB/s | ~70x slower |
+| `cudaMallocManaged` | 1.2–1.3 GB/s | ~150x slower |
 
-`probes/w28c_bw.py` + `probes/managed_alloc.cu` then measure the cost, running the *same*
-kernels over a pool from each allocator:
+**4. And device memory cannot simply be granted host access** (`probes/w28d_vmm_gate.py`).
+The VMM API allocates and maps fine, but `cuMemSetAccess` with a HOST (or HOST_NUMA)
+location on a DEVICE allocation returns `CUDA_ERROR_NOT_SUPPORTED`, and tensors from
+torch's `expandable_segments` (same API) still segfault on CPU read.
 
-| pool | bandwidth |
-|---|---|
-| `cudaMalloc` (today) | 223.4 GB/s |
-| `cudaMallocManaged` via `CUDAPluggableAllocator` | 203.2 GB/s |
-| | **0.91x** |
+The mechanism is in the device attributes: `pageableMemoryAccess=1` and
+`pageableMemoryAccessUsesHostPageTables=1`. Every host-addressable allocation is reached by
+the GPU through **host** page tables — fine for a contiguous stream, ruinous for scattered
+gathers, which is exactly attention's pattern. `cudaMemAdvise`/`cudaMemPrefetchAsync` are
+rejected as `invalid argument` here because on an integrated part there is one physical
+copy and nothing to migrate, so there is no placement hint that rescues it.
 
-and confirm on the managed arm that a real torch **CUDA tensor**'s bytes go straight to
-disk: `managed_host_addressable 1 pwritev_bytes 1048576`.
-
-So the trade is a measured ~9% of memory bandwidth on a bandwidth-bound benchmark, against
-removing the CPU tier (its RAM returns to the KV pool), the restore-window cap (restores
-bounded by disk instead of by tier size) and the 1.64x padding. What is *not* yet measured
-is the effect on real paged attention, whose access pattern differs from a contiguous
-elementwise pass, and the behaviour of a ~19 GB managed pool rather than 512 MB. GPUDirect
-Storage remains separately impossible here (no BAR1).
+**Conclusion: the CPU staging tier is structural on this hardware**, and so are the
+restore-window cap and the row padding. GPUDirect Storage is separately impossible (no
+BAR1). The lesson, which cost two wrong verdicts: benchmark with the access pattern of the
+real workload, not the one that is easy to write.
 
 ## Licence
 
