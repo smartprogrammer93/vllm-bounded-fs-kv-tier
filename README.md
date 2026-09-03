@@ -205,6 +205,31 @@ restore-window cap and the row padding. GPUDirect Storage is separately impossib
 BAR1). The lesson, which cost two wrong verdicts: benchmark with the access pattern of the
 real workload, not the one that is easy to write.
 
+## The CPU tier is mandatory; its SIZE is not
+
+The staging copy out of device memory cannot be avoided (above). But that is a copy, not a
+cache — and vLLM's CPU tier is both, which is why it costs gigabytes. Upstream's guidance
+is explicit that `cpu_bytes_to_use` should exceed the aggregate GPU KV cache, and because a
+restore stages every hit block before one CPU→GPU load, that also makes tier size the
+maximum restorable prefix (measured: 9 blocks → `cached=0`; 39 → ~25k tokens; 79 → ~50k).
+
+`probes/w30_probe.py` measures whether a streamed restore — K successive load jobs through
+a small fixed buffer — would be affordable:
+
+```
+a (fixed per job) = -0.028 ms      i.e. zero
+b (marginal)      = 0.0203 ms/MiB  -> 48.2 GB/s
+r2                = 1.000
+```
+
+There is no per-job overhead in the transfer path; a 307 MiB restore takes 6.2 ms. The only
+cost is the scheduler round trip, measured at 14.6 ms per decode step, so streaming
+1400 MiB through a 64 MiB buffer costs ~330 ms — against a cold prefill of the same prefix
+measured in seconds.
+
+So the gigabytes are an artefact of the tier being a cache, not a requirement of moving
+bytes to disk.
+
 ## Licence
 
 Apache-2.0. Not affiliated with the vLLM project.
