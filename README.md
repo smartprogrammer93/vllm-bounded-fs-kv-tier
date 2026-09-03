@@ -196,27 +196,34 @@ is why batches are capped at half the tier (`GLM53_OFFLOAD_STREAM_BATCH_BLOCKS`,
 
 ```mermaid
 flowchart LR
-    subgraph N1["Head node — DGX Spark GB10"]
-        G1["GPU KV pool<br/>1.70M tokens<br/>18.8 GB"]
-        C1["CPU staging tier<br/>79 blocks / 2 GiB<br/>a buffer, not a cache"]
-        D1["Disk tier<br/>100 GiB cap, LRU<br/>~6.8M tokens"]
+    subgraph N1["HEAD NODE — DGX Spark GB10"]
+        direction LR
+        G1["GPU KV pool<br/><b>1.70M tokens</b><br/>18.8 GB"]
+        C1["CPU staging tier<br/><b>79 blocks / 2 GiB</b><br/><i>a buffer, not a cache</i>"]
+        D1["Disk tier<br/><b>100 GiB cap, LRU</b><br/>~6.8M tokens"]
     end
-    subgraph N2["Peer node — rank 1"]
-        C2["CPU region<br/>own slot"]
-        D2["Disk shard<br/>_r1 files"]
+    subgraph N2["PEER NODE — rank 1"]
+        direction LR
+        C2["CPU region<br/><i>own slot only</i>"]
+        D2["Disk shard<br/><i>_r1 files</i>"]
     end
 
-    G1 -- "store 48.7 GB/s" --> C1
+    G1 -- "store<br/>48.7 GB/s" --> C1
     C1 -- "cascade" --> D1
-    D1 -- "read 5.34 GB/s" --> C1
-    C1 -- "restore 48.7 GB/s<br/>one batch at a time" --> G1
-    C1 -. "peer agent, own-slot writes<br/>fixes defect 3" .-> C2
+    D1 -- "read<br/>5.34 GB/s" --> C1
+    C1 == "restore 48.7 GB/s<br/><b>one batch at a time</b>" ==> G1
+    C1 -. "peer agent" .-> C2
     C2 --> D2
-    D1 -. "LRU deletions mirrored" .-> D2
+    D1 -. "LRU deletions<br/>mirrored" .-> D2
 
-    style G1 fill:#dbeafe,stroke:#3b82f6
-    style D1 fill:#fef3c7,stroke:#d97706
-    style D2 fill:#fef3c7,stroke:#d97706
+    classDef gpu  fill:#dbeafe,stroke:#3b82f6,stroke-width:2px
+    classDef cpu  fill:#ede9fe,stroke:#7c3aed,stroke-width:2px
+    classDef disk fill:#fed7aa,stroke:#ea580c,stroke-width:2px
+    class G1 gpu
+    class C1,C2 cpu
+    class D1,D2 disk
+    style N1 fill:#f6f8fa,stroke:#d0d7de,stroke-width:1px
+    style N2 fill:#f6f8fa,stroke:#d0d7de,stroke-width:1px
 ```
 
 Each rank writes only its **own** slot of the shared region and owns its own `_r<rank>`
@@ -249,7 +256,7 @@ Fixing 5 also halved the on-disk footprint — 51.81 MiB → **25.91 MiB** per r
 | `vllm_bounded_fs_tier.py` | `BoundedFileSystemTierManager` (byte cap + LRU) and `PeerMirroredFileSystemTierManager` (per-rank cascade, own-slot writes — fixes defect 3) |
 | `peer_kv_agent.py` | Runs in each remote rank's container; performs that rank's own cascade and promotion against its own region and `_r<rank>` files |
 | `tests/` | Offline suites — the patch chain against pristine upstream sources, and the batch-split arithmetic |
-| `probes/` | The measurement harnesses behind every number above |
+| `probes/` | Every measurement harness used in this work, including the needle probes and the restore-cost fit behind the numbers above |
 
 Both patches are idempotent, sentinel-guarded, and **fail closed** if upstream drifts: an
 anchor that no longer matches exactly once aborts the patch rather than half-applying it.
