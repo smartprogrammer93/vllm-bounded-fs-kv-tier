@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""W30 step 1: let a restore span MULTIPLE load jobs (the chaining primitive).
+"""W30: chained restore -- step 1 (primitive) + step 2a (per-group batching).
 
 WHY
 ---
@@ -139,6 +139,210 @@ CLEAR_NEW = '''        self._load_jobs.clear()
 '''
 CLEAR_SENTINEL = "self._nonfinal_load_jobs.clear()"
 
+# ===========================================================================
+# W30 step 2a: issue the restore as one load job PER KV GROUP, chained.
+#
+# A single job requires every hit block resident in the CPU tier at once. This
+# splits it per group, which is valid because CPUGPUOffloadingWorker._transfer
+# walks groups positionally and short-circuits `if group_size == 0: continue` --
+# so a job carrying only group g's blocks works as long as group_sizes and
+# block_indices keep their full length, with zeros elsewhere. Its
+# src_offset/dst_offset asserts still balance because only group g contributes
+# block ids.
+#
+# All but the last job are marked non-final, so the worker withholds
+# finished_recving (step 1) and the request is not resumed against a partially
+# restored prefix.
+#
+# NOTE ON SCOPE: this alone does NOT shrink the CPU tier, because promotion
+# still happens during _lookup, which pulls every hit block in before
+# update_state_after_alloc runs. It exists to prove the chained-load path
+# end-to-end -- correct output with K>1 jobs -- which is the prerequisite for
+# step 2b, where promotion becomes per-batch and the tier can shrink to a fixed
+# buffer. Sequencing it this way is deliberate: the load path is where this
+# work has produced silent corruption twice.
+# ===========================================================================
+
+SCHED = VLLM / "distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py"
+
+SPANINIT_OLD = """        keys_to_load: list[OffloadKey] = []
+        dst_block_ids: list[int] = []
+        # per group
+        group_sizes: list[int] = []
+        block_indices: list[int] = []
+"""
+SPANINIT_NEW = """        keys_to_load: list[OffloadKey] = []
+        dst_block_ids: list[int] = []
+        # per group
+        group_sizes: list[int] = []
+        block_indices: list[int] = []
+        # LOCAL [glm53-offload-streaming]: (key_lo, key_hi, blk_lo, blk_hi) per
+        # group, so the flat lists can be sliced into per-group load jobs
+        # without restructuring the accumulation below.
+        _stream_spans: list[tuple[int, int, int, int]] = []
+"""
+SPANINIT_SENTINEL = "_stream_spans: list[tuple[int, int, int, int]] = []"
+
+SPANSTART_OLD = """            self._current_batch_allocated_block_ids.update(
+                block.block_id for block in group_blocks if block.block_id != 0
+            )
+"""
+SPANSTART_NEW = """            _k0, _d0 = len(keys_to_load), len(dst_block_ids)
+            self._current_batch_allocated_block_ids.update(
+                block.block_id for block in group_blocks if block.block_id != 0
+            )
+"""
+SPANSTART_SENTINEL = "_k0, _d0 = len(keys_to_load), len(dst_block_ids)"
+
+SPANSKIP_OLD = """            if group_config.group_idx in self._non_shareable_groups:
+                group_sizes.append(0)
+                block_indices.append(0)
+                continue
+"""
+SPANSKIP_NEW = """            if group_config.group_idx in self._non_shareable_groups:
+                group_sizes.append(0)
+                block_indices.append(0)
+                # keep one span per group so span index == group index
+                _stream_spans.append((_k0, _k0, _d0, _d0))
+                continue
+"""
+SPANSKIP_SENTINEL = "keep one span per group so span index == group index"
+
+SPANEND_OLD = """            group_sizes.append(num_pending_gpu_blocks)
+            block_indices.append(num_locally_computed_gpu_blocks)
+"""
+SPANEND_NEW = """            group_sizes.append(num_pending_gpu_blocks)
+            block_indices.append(num_locally_computed_gpu_blocks)
+            _stream_spans.append((_k0, len(keys_to_load), _d0, len(dst_block_ids)))
+"""
+SPANEND_SENTINEL = "_stream_spans.append((_k0, len(keys_to_load)"
+
+ISSUE_OLD = """        src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+        dst_spec = GPULoadStoreSpec(
+            dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
+        )
+
+        load_job_id = self._generate_job_id()
+        self._current_batch_load_jobs[load_job_id] = TransferJob(
+            req_id=request.request_id,
+            src_spec=src_spec,
+            dst_spec=dst_spec,
+        )
+        # a load can only be issued when no other jobs are pending.
+        assert not req_status.transfer_jobs
+        req_status.transfer_jobs.add(load_job_id)
+        self._jobs[load_job_id] = TransferJobStatus(
+            req_id=request.request_id,
+            pending_count=self.config.num_workers,
+            keys=set(keys_to_load),
+            is_store=False,
+        )
+"""
+ISSUE_NEW = """        # LOCAL [glm53-offload-streaming]: one chained load job per KV group.
+        assert not req_status.transfer_jobs
+        self._issue_chained_load(
+            request, req_status, keys_to_load, dst_block_ids,
+            group_sizes, block_indices, _stream_spans,
+        )
+"""
+ISSUE_SENTINEL = "one chained load job per KV group"
+
+HELPER_OLD = """    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ):
+"""
+HELPER_NEW = '''    def _issue_chained_load(
+        self, request, req_status, keys_to_load, dst_block_ids,
+        group_sizes, block_indices, spans,
+    ) -> None:
+        """LOCAL [glm53-offload-streaming]: emit the restore as one job per group.
+
+        group_sizes/block_indices keep full length with zeros outside the group
+        being loaded, which the worker skips. Every job but the last is marked
+        non-final so the request is not resumed against a partial prefix.
+        """
+        batches = []
+        for gi, (k0, k1, d0, d1) in enumerate(spans):
+            if d1 <= d0:
+                continue
+            gs = [0] * len(group_sizes)
+            bi = [0] * len(block_indices)
+            gs[gi] = group_sizes[gi]
+            bi[gi] = block_indices[gi]
+            batches.append((keys_to_load[k0:k1], dst_block_ids[d0:d1], gs, bi))
+
+        if not batches:
+            return
+        for idx, (keys, blocks_, gs, bi) in enumerate(batches):
+            src_spec = self.manager.prepare_load(keys, req_status.req_context)
+            dst_spec = GPULoadStoreSpec(
+                blocks_, group_sizes=gs, block_indices=bi
+            )
+            job_id = self._generate_job_id()
+            self._current_batch_load_jobs[job_id] = TransferJob(
+                req_id=request.request_id,
+                src_spec=src_spec,
+                dst_spec=dst_spec,
+            )
+            req_status.transfer_jobs.add(job_id)
+            self._jobs[job_id] = TransferJobStatus(
+                req_id=request.request_id,
+                pending_count=self.config.num_workers,
+                keys=set(keys),
+                is_store=False,
+            )
+            if idx < len(batches) - 1:
+                self._stream_nonfinal_jobs.add(job_id)
+        logger.debug(
+            "Request %s: restore issued as %d chained load job(s)",
+            request.request_id, len(batches),
+        )
+
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ):
+'''
+HELPER_SENTINEL = "def _issue_chained_load("
+
+NFSET_OLD = """        self._req_status: dict[ReqId, RequestOffloadState] = {}
+"""
+NFSET_NEW = """        self._req_status: dict[ReqId, RequestOffloadState] = {}
+        # LOCAL [glm53-offload-streaming]: load jobs that must not release
+        # their request yet; drained into the worker metadata each step.
+        self._stream_nonfinal_jobs: set[int] = set()
+"""
+NFSET_SENTINEL = "_stream_nonfinal_jobs: set[int] = set()"
+
+METAPASS_OLD = """        meta = OffloadingConnectorMetadata(
+            load_jobs=self._current_batch_load_jobs,
+            store_jobs=partial_store_jobs | normal_store_jobs,
+            jobs_to_flush=self._current_batch_jobs_to_flush,
+        )
+"""
+METAPASS_NEW = """        meta = OffloadingConnectorMetadata(
+            load_jobs=self._current_batch_load_jobs,
+            store_jobs=partial_store_jobs | normal_store_jobs,
+            jobs_to_flush=self._current_batch_jobs_to_flush,
+            # LOCAL [glm53-offload-streaming]: hand the worker the loads that
+            # must not release their request, then reset for the next step.
+            nonfinal_load_jobs=(set(self._stream_nonfinal_jobs)
+                                if self._stream_nonfinal_jobs else None),
+        )
+        self._stream_nonfinal_jobs.clear()
+"""
+METAPASS_SENTINEL = "hand the worker the loads that"
+
+SCHED_EDITS = [
+    ("sched:nonfinal-set", NFSET_OLD, NFSET_NEW, NFSET_SENTINEL),
+    ("sched:span-init", SPANINIT_OLD, SPANINIT_NEW, SPANINIT_SENTINEL),
+    ("sched:span-start", SPANSTART_OLD, SPANSTART_NEW, SPANSTART_SENTINEL),
+    ("sched:span-skip", SPANSKIP_OLD, SPANSKIP_NEW, SPANSKIP_SENTINEL),
+    ("sched:span-end", SPANEND_OLD, SPANEND_NEW, SPANEND_SENTINEL),
+    ("sched:helper", HELPER_OLD, HELPER_NEW, HELPER_SENTINEL),
+    ("sched:issue-chained", ISSUE_OLD, ISSUE_NEW, ISSUE_SENTINEL),
+    ("sched:meta-pass", METAPASS_OLD, METAPASS_NEW, METAPASS_SENTINEL),
+]
+
 COMMON_EDITS = [("common:metadata-field", META_OLD, META_NEW, META_SENTINEL)]
 WORKER_EDITS = [
     ("worker:nonfinal-set", INIT_OLD, INIT_NEW, INIT_SENTINEL),
@@ -182,6 +386,7 @@ def main() -> int:
         return 0
     print(f"{MARK} {apply_edits(COMMON, COMMON_EDITS)}")
     print(f"{MARK} {apply_edits(WORKER, WORKER_EDITS)}")
+    print(f"{MARK} {apply_edits(SCHED, SCHED_EDITS)}")
     return 0
 
 
