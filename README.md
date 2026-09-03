@@ -287,11 +287,46 @@ block ids will therefore be wrong by ~7.6×.
 Deployed and serving: 260 GB tier, KV pool pinned at 1.90× (770 usable block ids,
 1,899,014 tokens), `GLM53_OFFLOAD_STREAM_RESTORE=0`, single tier with no secondary.
 
-> [!WARNING]
-> **Concurrency under this design is being measured and is not yet reported here.** The
-> streamed restore's N ≥ 6 stall is expected to be structurally absent — there is no
-> promotion step left to stall on — but *expected* is not *measured*, and this README does
-> not carry unmeasured claims. The result will be added when the ramp completes.
+### Concurrency: measured, N = 2 to 8
+
+The streamed restore stalls from N = 6. Under the disk-backed tier the same ramp is clean to
+N = 8 — 20 sessions of ~60k tokens, each evicted by pushing 2.00M tokens of filler through
+the pool, each carrying five needles at 10/30/50/70/90% depth and a session-unique prefix so
+a truncated restore and a cross-session mix-up are distinguishable:
+
+| N | wall | needle recall | stalls | tier alloc retries | throughput vs cold |
+|---|---|---|---|---|---|
+| 2 | 18.7 s | 5/5 × 2 | 0 | 0 | **7.1×** |
+| 4 | 32.8 s | 5/5 × 4 | 0 | 0 | **8.1×** |
+| 6 | 47.3 s | 5/5 × 6 | 0 | 0 | **8.4×** |
+| 8 | 75.6 s | 5/5 × 8 | 0 | 0 | **7.0×** |
+
+**20 of 20 restores correct, no stalls, no tier pressure at any rung.**
+
+```text
+throughput gain per wave, vs prefilling the same tokens at 902 tok/s
+
+N=2  ███████████████████████████████████·······  7.1x
+N=4  ████████████████████████████████████████··  8.1x
+N=6  ██████████████████████████████████████████  8.4x
+N=8  ██████████████████████████████████·······   7.0x
+```
+
+> [!IMPORTANT]
+> **Measure the wave, not the request.** Per-session TTFT decays from 4.0× at N=2 to 0.9× at
+> N=8, which looks like the benefit evaporating. It is not: that ratio compares *concurrent*
+> restores against a *sequential* cold prefill — a baseline nobody gets on a loaded server.
+> Against the same tokens prefilled at the measured rate, the gain is flat at 7–8× across
+> every rung. Concurrency costs per-request latency, not throughput.
+
+Two counters read as failures here and are not. `disk_hits` stays 0 because the probe counts
+tiers *excluding* the primary and there is now only `tier="0:primary"` — the tier **is** the
+disk. Transfer shows up instead as `CPU->GPU +7433 MiB` over 16 load jobs at N=8. And every
+session restores exactly **53,760 of ~60,000 tokens (89.6%)**, the remaining 6,240 being the
+Mamba alignment tail, inside the ≤ 7168 bound.
+
+The tier absorbed 3.20M tokens (1.20M seeded + 2.00M filler) with the *oldest* session still
+restoring in full, which tightens the row bound above to `rows_per_segment ≤ 5.36`.
 
 ```jsonc
 // kv_transfer_config under the disk-backed design — note: no secondary_tiers
@@ -535,7 +570,8 @@ an engine upgrade that moves an API fails there rather than silently corrupting 
   Bisecting with `GLM53_OFFLOAD_STREAM_RESTORE=0` showed pristine vLLM completing the same
   wave, which isolates the defect to `patch_offload_streaming_restore.py` — not to vLLM. One
   real bug was found and fixed on the way (async-lookup `RETRY` churn, fixed with a memo);
-  the stall itself is **not fixed**. Treat the streamed restore as sequential-only.
+  the stall itself is **not fixed**. Treat the streamed restore as sequential-only — or use
+  the disk-backed tier instead, which runs the same ramp clean to N=8.
 * **A residual 1.64× storage overhead remains**: rows are uniform across groups, so a
   2.48 MiB MLA payload still occupies a 25.91 MiB row. Removing it needs ragged per-group
   rows across `config.py`, `cpu/spec.py`, `shared_offload_region.py` and the CPU worker's
