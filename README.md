@@ -123,6 +123,52 @@ contents, same GPU pool — toggling only `GLM53_OFFLOAD_STREAM_RESTORE`:
 
 Repeated at 15.6k with 3 trials: **9/9 restores, 5/5 needle recall on 9 of 9, 0 stalls.**
 
+### In production, under real load
+
+The numbers above are controlled experiments. This is the same build serving a live
+multi-agent coding workload — 18 concurrent agents, contexts from 26k to 205k, nobody
+running a benchmark:
+
+| | |
+|---|---|
+| GPU KV pool | **98% used**, 29 preemptions |
+| requests | 7 running, 7 waiting (some on `capacity`, not just `deferred`) |
+| **offload load jobs** | **722**, climbing ~100/min |
+| **tokens served from disk** | **1.38M** |
+| disk hit rate, sampled under pressure | **29.5%** of everything the GPU cache missed |
+
+Those are tokens the agents would otherwise have re-prefilled.
+
+### It engages from cache turnover, not from pool saturation
+
+This is the part that is easy to get wrong, and we got it wrong first: you do **not** have to
+fill the pool for offload to matter. Earlier the same day, with the pool at **47% and zero
+preemptions**, 63.4% of prefix lookups were already missing the GPU cache and disk was
+already serving them.
+
+`BlockPool.free_blocks` appends *hashed* blocks to the back of the free queue and
+`get_new_blocks` pops from the front, so **every allocation recycles the oldest cached
+block** regardless of how full the pool is. Eviction is paced by allocation rate, not by
+occupancy. With 13.2M prompt tokens through a 1.70M-token pool — **7.8× turnover** — every
+cached prefix had been recycled several times over.
+
+So the useful sizing question is not "will my working set exceed the pool" but "how much
+prefix re-use is my workload losing to turnover".
+
+### Reading the metrics: three that do not mean what they say
+
+Each of these produced a wrong conclusion before it was caught:
+
+| Metric | What it looks like | What it is |
+|---|---|---|
+| `kv_cache_usage_perc` | how much cache is retained | blocks allocated to **currently running** requests. 47% does not mean 53% of your cached prefixes survive |
+| `prompt_tokens_total` | prefill work done | **all** prompt tokens submitted, cache hits included. In one window 70,656 of 73,376 were cached — real work was 45 tok/s, not 1,223. Use `prefix_cache_queries − hits` |
+| `external_prefix_cache_hits / queries` | disk's hit rate | denominator includes **first-time content that can never hit**. Cumulative read 12.2%; sampled under real pressure, 29.5% |
+
+And one label: `kv_offload_tiering_*` tags secondary tiers `tier="<idx>:<ClassName>"`, not
+`tier="<idx>"`. Matching on `tier="0"` reports **zero disk hits for a run that took 155** —
+the primary is `tier="0:primary"`. Match by excluding the primary, not by including an index.
+
 ### Capacity
 
 ```text
