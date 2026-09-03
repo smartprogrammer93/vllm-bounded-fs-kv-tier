@@ -288,6 +288,23 @@ The 7168 was Mamba alignment (cache mode `align`, 2 chunks per unit), and it mov
 prompt did. The single 4/5 did not reproduce in 9 revisits — both anomalies across the two
 runs were the *first* revisit after a boot, before the disk cascade had settled.
 
+**At prod scale** (1M context, 18.8 GB pin, 1,704,433-token pool, 79-block tier), a 125k
+session evicted by flushing the whole pool and then revisited:
+
+| | |
+|---|---|
+| `cached_tokens` | **118,272 — 94.8% of a 124,816-token prompt** |
+| CPU→GPU | 1862 MiB (~72 blocks), 959 MiB of it from disk |
+| TTFT | **148.3 s → 8.4 s (17.6×)** |
+| needle recall / stalls / `NV_ERR_NO_MEMORY` | 5/5 · 0 · 0 |
+
+Read that carefully, though: 72 blocks against a 79-block tier means **the tier was not
+binding at 125k**, so the eager path would likely have served it too, and the 17.6× is
+restore-vs-cold-prefill — the value of offload in general, not of streaming. A chunk costs
+~2.18 blocks here (Mamba groups store snapshots, not one block per chunk), so a 79-block
+tier holds ~36 chunks and begins to bind above **~130k tokens**. That, up to the 1M ceiling,
+is where streaming earns its place.
+
 It cannot deadlock: `prepare_load` pins a block with `ref_cnt += 1` and `complete_load`
 drops it back to 0, returning it to the evictable set, so batch *k*'s blocks are reusable
 the moment its load completes. Progress is guaranteed as long as a single batch fits, which
