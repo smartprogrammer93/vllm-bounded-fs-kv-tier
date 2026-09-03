@@ -24,9 +24,39 @@ import os
 import sys
 from pathlib import Path
 
-PRISTINE = Path(os.environ.get("PRISTINE", "/tmp/pristine/vllm"))
-PATCH = Path(os.environ.get(
-    "PATCH", "/home/ahmad/glm53-exl3/overlay/patch_offload_streaming_restore.py"))
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+
+
+def _pick(env, *candidates):
+    """Prefer $env, else the first candidate that exists, else the first.
+
+    These default to the copies in THIS repo. An earlier version defaulted to
+    the author's deployment paths, which made the tests unrunnable for anyone
+    who cloned the repo -- found by running them in a clean clone of the pushed
+    tree, which is the only way that class of mistake shows up.
+    """
+    v = os.environ.get(env)
+    if v:
+        return Path(v)
+    for c in candidates:
+        if Path(c).exists():
+            return Path(c)
+    return Path(candidates[0])
+
+
+PRISTINE = _pick("PRISTINE", "/tmp/pristine/vllm",
+                 "/usr/local/lib/python3.12/dist-packages/vllm")
+PATCH = _pick("PATCH", REPO / "patch_offload_streaming_restore.py")
+GROUPS = _pick("GROUPS_PATCH", REPO / "patch_offload_nonshareable_groups.py")
+
+if not PRISTINE.is_dir():
+    print("SKIP: no vLLM source tree at %s" % PRISTINE)
+    print("      This test applies the patch chain to real upstream sources.")
+    print("      Point it at a copy:  PRISTINE=/path/to/site-packages/vllm")
+    print("      Nothing is written back -- a read-only copy is fine.")
+    raise SystemExit(0)
 
 fails = []
 
@@ -36,11 +66,6 @@ def check(name, cond, detail=""):
                            (" -- " + detail) if detail else ""))
     if not cond:
         fails.append(name)
-
-
-GROUPS = Path(os.environ.get(
-    "GROUPS_PATCH",
-    "/home/ahmad/glm53-exl3/overlay/patch_offload_group_filter.py"))
 
 
 def load(name, path):
