@@ -270,9 +270,23 @@ returns MISS, and the truncated 1-chunk hit falls below the model's 2-chunk Mamb
 unit, so it rounds to nothing. Identical to the byte on all six revisits.
 
 The arm moves **10 offload blocks through a 9-block tier**, which is the decoupling: under
-the eager path the 10th promotion is exactly what fails. Note the 7168 ceiling here is
-*not* the tier — the prompt is 3.99 chunks and Mamba cache mode is `align`, so 2 chunks is
-one alignment unit and 4 chunks (14,336 tokens) is out of reach of a 14,290-token prompt.
+the eager path the 10th promotion is exactly what fails.
+
+**The ceiling tracks the prompt, not the tier.** Re-running with a 15.6k-token prompt
+(4.35 chunks instead of 3.99) and 3 trials on the same 9-block tier:
+
+| | 14.3k prompt | 15.6k prompt |
+|---|---|---|
+| `cached_tokens` | 7168 (2 chunks) | **10752 (3 chunks)** |
+| bytes CPU→GPU | 256 MiB | 307 MiB (~12 blocks) |
+| restores | 6/6 | **9/9** |
+| needle recall | 5/5 on 5 of 6 | **5/5 on 9 of 9** |
+| stalled restores | — | **0** |
+| warm TTFT speedup | 1.3–1.8× | **2.9–3.3×** |
+
+The 7168 was Mamba alignment (cache mode `align`, 2 chunks per unit), and it moved when the
+prompt did. The single 4/5 did not reproduce in 9 revisits — both anomalies across the two
+runs were the *first* revisit after a boot, before the disk cascade had settled.
 
 It cannot deadlock: `prepare_load` pins a block with `ref_cnt += 1` and `complete_load`
 drops it back to 0, returning it to the evictable set, so batch *k*'s blocks are reusable
