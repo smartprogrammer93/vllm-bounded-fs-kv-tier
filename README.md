@@ -302,8 +302,23 @@ Read that carefully, though: 72 blocks against a 79-block tier means **the tier 
 binding at 125k**, so the eager path would likely have served it too, and the 17.6× is
 restore-vs-cold-prefill — the value of offload in general, not of streaming. A chunk costs
 ~2.18 blocks here (Mamba groups store snapshots, not one block per chunk), so a 79-block
-tier holds ~36 chunks and begins to bind above **~130k tokens**. That, up to the 1M ceiling,
-is where streaming earns its place.
+tier holds ~36 chunks and begins to bind above **~130k tokens**.
+
+**At 250k it does bind**, and this is the run that isolates what streaming buys:
+
+| | 125k | **250k** |
+|---|---|---|
+| `cached_tokens` | 118,272 (94.8%) | **243,712 (97.6%)** |
+| CPU→GPU | 1862 MiB (~72 blk) | **3675 MiB (~142 blk)** |
+| vs the 79-block tier | 0.9× — not binding | **1.8× — binding** |
+| chained load jobs | 10 | 12 |
+| TTFT | 148.3 s → 8.4 s (17.6×) | **250.6 s → 8.3 s (30.2×)** |
+| recall / stalls | 5/5 · 0 | **5/5 · 0** |
+
+**142 blocks through a 79-block tier** is something the eager path structurally cannot do —
+its 80th promotion fails, `lookup` returns MISS, and the scan truncates. Restoring 97.6% of
+a quarter-million-token prompt in 8.3 s against a 250 s cold prefill is only available
+streamed.
 
 It cannot deadlock: `prepare_load` pins a block with `ref_cnt += 1` and `complete_load`
 drops it back to 0, returning it to the evictable set, so batch *k*'s blocks are reusable
