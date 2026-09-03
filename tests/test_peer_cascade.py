@@ -234,6 +234,32 @@ check("every idempotence sentinel is absent from every OTHER edit's "
       not _collisions, str(_collisions))
 check("found a plausible number of sentinels", len(_sents) >= 9, str(len(_sents)))
 
+_stream_path = os.path.join(ROOT, "patch_offload_streaming_restore.py")
+if os.path.exists(_stream_path):
+    _sp = open(_stream_path).read()
+    _q = chr(39) * 3
+    _sp_sents = dict(_re.findall(r'^(\w+_SENTINEL) = "([^"]+)"', _sp, _re.M))
+    _sp_news = dict(_re.findall(r"^(\w+_NEW) = " + _q + r"(.*?)" + _q, _sp,
+                                _re.M | _re.S))
+    # A collision only matters WITHIN one edit list: two edits targeting
+    # different files may legitimately share a token.
+    _lists = _re.findall(r"^(\w+)_EDITS = \[(.*?)\]", _sp, _re.M | _re.S)
+    _bad = []
+    for _lname, _body in _lists:
+        _members = set(_re.findall(r"(\w+)_SENTINEL", _body))
+        for _m in _members:
+            _v = _sp_sents.get(_m + "_SENTINEL")
+            for _o in _members:
+                if _o != _m and _v and _v in (_sp_news.get(_o + "_NEW") or ""):
+                    _bad.append((_lname, _m, _o))
+    check("streaming patch: no sentinel collides within its own edit list",
+          not _bad, str(_bad))
+    check("streaming patch is gated and defaults off",
+          'GLM53_OFFLOAD_STREAM_RESTORE", "0"' in _sp)
+    check("worker withholds non-final loads from finished_recving",
+          "_nonfinal_load_jobs" in _sp and "finished_recving.add(req_id)" in _sp)
+
+
 print()
 if fails:
     print(f"FAILED ({len(fails)}): " + ", ".join(fails))
