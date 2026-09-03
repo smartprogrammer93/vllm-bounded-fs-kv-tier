@@ -176,10 +176,22 @@ scattered pages out of it. Re-measured with a random block gather
 | `cudaHostAlloc` (pinned) | 2.8 GB/s | ~70x slower |
 | `cudaMallocManaged` | 1.2–1.3 GB/s | ~150x slower |
 
-**4. And device memory cannot simply be granted host access** (`probes/w28d_vmm_gate.py`).
-The VMM API allocates and maps fine, but `cuMemSetAccess` with a HOST (or HOST_NUMA)
-location on a DEVICE allocation returns `CUDA_ERROR_NOT_SUPPORTED`, and tensors from
-torch's `expandable_segments` (same API) still segfault on CPU read.
+**4. And device memory cannot be made CPU-visible by any route.** A better-targeted idea
+is to leave the pool as device memory (attention keeps its full gathers) and take a second,
+CPU-readable view of the same pages purely for the sequential copy out — which would sidestep
+the gather penalty entirely. Every route is refused
+(`probes/w28d_vmm_gate.py`, `probes/w28f_export.py`):
+
+| route | result |
+|---|---|
+| `cuMemSetAccess`, HOST or HOST_NUMA on a DEVICE allocation | `CUDA_ERROR_NOT_SUPPORTED` |
+| device range → `cuMemGetHandleForAddressRange(DMA_BUF_FD)` | `CUDA_ERROR_INVALID_VALUE` |
+| `cuMemExportToShareableHandle(POSIX_FILE_DESCRIPTOR)` | fd returned; `mmap` and `pread` both `EINVAL` |
+| torch `expandable_segments` tensor, CPU read | SIGSEGV |
+
+The shareable-handle fd is an IPC token for import by another CUDA process, not a readable
+byte stream. dma-buf export being refused is consistent with GB10 having no BAR1 — the same
+aperture GPUDirect Storage needs.
 
 The mechanism is in the device attributes: `pageableMemoryAccess=1` and
 `pageableMemoryAccessUsesHostPageTables=1`. Every host-addressable allocation is reached by
