@@ -250,9 +250,36 @@ bytes to disk.
    promotes each batch immediately before issuing its load, so only one batch need ever be
    resident.
 
+**Measured A/B.** Identical 9-block (256 MiB) primary tier, identical documents, identical
+22 GB of disk residue, identical 18,385-token GPU pool — the only difference is
+`GLM53_OFFLOAD_STREAM_RESTORE`:
+
+| per revisit | control (vLLM pristine) | arm (streamed) |
+|---|---|---|
+| read from disk | 233 MiB (12 blocks) | 256 MiB |
+| **delivered to GPU** | **0 MiB** | **256 MiB** |
+| load jobs issued | **0** | 10 (5 groups × 2 workers) |
+| `cached_tokens` | **0** | **7168** |
+| restores that happened | **0 / 6** | **6 / 6** |
+| needle recall | 5/5 | 5/5 on 5 of 6, 4/5 on 1 |
+
+The control's failure mode is worse than a cap: **it pays the full disk read — 233 MiB,
+which is 9 × 25.91 MiB, the entire primary tier — then issues zero load jobs and delivers
+zero bytes.** The scan promotes until the tier is full, the next promotion fails, lookup
+returns MISS, and the truncated 1-chunk hit falls below the model's 2-chunk Mamba alignment
+unit, so it rounds to nothing. Identical to the byte on all six revisits.
+
+The arm moves **10 offload blocks through a 9-block tier**, which is the decoupling: under
+the eager path the 10th promotion is exactly what fails. Note the 7168 ceiling here is
+*not* the tier — the prompt is 3.99 chunks and Mamba cache mode is `align`, so 2 chunks is
+one alignment unit and 4 chunks (14,336 tokens) is out of reach of a 14,290-token prompt.
+
 It cannot deadlock: `prepare_load` pins a block with `ref_cnt += 1` and `complete_load`
 drops it back to 0, returning it to the evictable set, so batch *k*'s blocks are reusable
-the moment its load completes. Progress is guaranteed as long as a single batch fits.
+the moment its load completes. Progress is guaranteed as long as a single batch fits, which
+is why batches are capped at half the tier (`GLM53_OFFLOAD_STREAM_BATCH_BLOCKS`, 0 = auto):
+one group's batch is otherwise unbounded, since a 1M-token restore is ~280 offload blocks
+against a 79-block tier.
 
 The residual risk is liveness, not correctness. Once lookup reports the larger hit vLLM has
 committed to it, and a queued batch holds no reference — so another request's stores could

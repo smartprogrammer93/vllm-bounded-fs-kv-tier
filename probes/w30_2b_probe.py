@@ -197,8 +197,15 @@ if __name__ == "__main__":
                       c["promo_fail"] - b["promo_fail"],
                       "  CONTAMINATED: %s" % others if others else "",
                       "  DEGENERATE OUTPUT" if degenerate else ""), flush=True)
-            if not hits:
-                print("       answer was: %r" % a[:160], flush=True)
+            if len(hits) < len(DEPTHS):
+                # Print on ANY shortfall, not only on zero. A partial recall is
+                # the signature that separates a truncated restore (early
+                # needles present, late ones gone) from the model simply not
+                # listing all five, and that distinction is invisible without
+                # the text.
+                print("       missed %s; answer was: %r" % (
+                    [n for n in needles(s) if n not in hits], a[:200]),
+                    flush=True)
             rows.append((trial, s, cold[s], t, k, len(hits),
                          c["jobs"] - b["jobs"],
                          (c["c2g"] - b["c2g"]) / 2 ** 20, ok))
