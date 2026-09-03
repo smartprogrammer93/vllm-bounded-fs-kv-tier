@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""W30: chained restore -- step 1 (primitive) + step 2a (per-group batching).
+"""W30: streamed restore -- the CPU tier stops bounding the restore size.
 
 WHY
 ---
@@ -37,19 +37,44 @@ the request only then. This patch adds that and nothing else: it is the
 primitive the batching pipeline is built on, and it is a no-op until a scheduler
 actually marks a job non-final.
 
-WHAT IS DELIBERATELY NOT HERE
------------------------------
-The batching itself (splitting `keys_to_load` by chunk range, promoting batch
-k+1 from the FS tier, polling until resident, then issuing its GPU load). That
-needs a per-request state machine driven from `build_connector_meta`, because
-`TieringOffloadingManager.prepare_load` requires keys "already confirmed HIT by
-lookup() earlier this step" and increments ref_cnt to pin them -- so a later
-batch must be promoted and awaited first. Landing that on top of an unvalidated
-primitive is how the earlier silent-corruption bugs happened.
+WHAT THE THREE STEPS DO
+-----------------------
+step 1  -- the primitive above: a restore may span several load jobs.
+step 2a -- split the restore into one job per KV group. Valid because
+           `CPUGPUOffloadingWorker._transfer` walks groups positionally and
+           short-circuits on `group_size == 0`, so a job carrying one group
+           works if `group_sizes`/`block_indices` keep full length with zeros
+           elsewhere.
+step 2b -- stop the tier from bounding the restore. `TieringOffloadingManager
+           .lookup` promoted every hit block during the prefix scan and returned
+           MISS once the tier was full, which is precisely what made tier size
+           the maximum restorable prefix. It now reports the hit and the
+           connector promotes each batch immediately before issuing its load,
+           so only ONE batch need ever be resident.
 
-Idempotent, sentinel-guarded, fails closed on drift. Gated on
-GLM53_OFFLOAD_STREAM_RESTORE=1; vLLM is untouched otherwise. The field defaults
+           This cannot deadlock: `prepare_load` pins a block with `ref_cnt += 1`
+           and `complete_load` drops it back to 0, returning it to the evictable
+           set, so batch k's blocks are reusable the moment its load completes.
+           Progress is guaranteed as long as a single batch fits.
+
+           The residual risk is liveness, not correctness. Once lookup reports
+           the larger hit, vLLM has committed to it, and a queued batch holds no
+           reference -- so another request's stores could in principle evict its
+           blocks from the disk tier mid-restore. The driver `touch()`es every
+           queued key each step to keep them most-recently-used against exactly
+           that; if a batch stalls anyway, that one request hangs, loudly and
+           logged, and self-heals when the client disconnects. It never runs the
+           model against a prefix that was not restored.
+
+Knobs: GLM53_OFFLOAD_STREAM_RESTORE=1 enables everything (vLLM is untouched
+otherwise); GLM53_OFFLOAD_STREAM_SEQUENTIAL=0 reverts to step 2a's behaviour of
+issuing all batches up front, which keeps the tier as the bound.
+
+Idempotent, sentinel-guarded, fails closed on drift. The metadata field defaults
 to None so metadata built by an unpatched scheduler behaves exactly as before.
+tests/test_streaming_patch.py applies the whole chain to pristine upstream
+sources offline and checks anchors, ordering, indentation and idempotence; run
+it before any container start.
 """
 
 from __future__ import annotations
@@ -343,6 +368,338 @@ SCHED_EDITS = [
     ("sched:meta-pass", METAPASS_OLD, METAPASS_NEW, METAPASS_SENTINEL),
 ]
 
+# ===========================================================================
+# W30 step 2b: promote PER BATCH, so the CPU tier stops bounding the restore.
+#
+# Steps 1 and 2a made a restore span several load jobs, but the tier's
+# high-water mark was unchanged: TieringOffloadingManager.lookup() promotes
+# every hit block as it is looked up, during the prefix scan, long before
+# update_state_after_alloc runs. When the tier is full, _initiate_promotion
+# fails and lookup returns MISS, which truncates the scan -- that is exactly
+# where `tier size == maximum restorable prefix` comes from (measured: 9 blocks
+# -> cached=0, 39 -> 25k tokens, 79 -> 50k).
+#
+# Here lookup reports a HIT for a block it could not promote, and the connector
+# promotes each batch just before issuing its load.
+#
+# WHY THIS CANNOT DEADLOCK: prepare_load pins a block with ref_cnt += 1 and
+# complete_load drops it back to 0, returning it to the evictable set
+# (cpu/manager.py:140-166). So batch k's blocks become reusable the moment its
+# load completes, and batch k+1's promotion can evict them. Progress is
+# guaranteed as long as a SINGLE batch fits, which is why batches are per group.
+#
+# THE RISK IS LIVENESS, NOT CORRUPTION. Once lookup reports the larger hit, vLLM
+# has committed to it and the request waits on finished_recving, which step 1
+# withholds until the final batch lands. Two things could stall a batch:
+#   * its promotion never gets capacity -- impossible per the argument above;
+#   * its blocks get evicted from the DISK tier by another request's stores
+#     while the plan is still queued, since a queued batch holds no reference.
+# The second is real, so the driver touch()es every remaining key each step,
+# making them most-recently-used and so the last things LRU would evict. If a
+# batch does stall anyway the request hangs -- visibly, and only that request;
+# it is logged as an ERROR and self-heals when the client disconnects and vLLM
+# aborts the request. That is a deliberately better failure mode than either
+# crashing the server or loading blocks that were never restored.
+# ===========================================================================
+
+MANAGER = VLLM / "v1/kv_offload/tiering/manager.py"
+
+# --- manager: report the hit, let the connector do the promotion -------------
+
+DEFER_OLD = """                promoted = self._initiate_promotion(i, key, req_context)
+                return LookupResult.MISS if not promoted else LookupResult.HIT_PENDING
+"""
+DEFER_NEW = """                if self._stream_defer_enabled():
+                    # LOCAL [glm53-offload-streaming]: report the hit and do NOT
+                    # promote. Promotion during the prefix scan is what ties
+                    # restore size to tier size, in BOTH branches of the
+                    # original line below:
+                    #   * promotion fails (tier full) -> MISS -> the scan stops
+                    #     there, so tier size caps the restore;
+                    #   * promotion succeeds -> HIT_PENDING -> the scan defers
+                    #     and the scheduler re-queries next step. With a tier
+                    #     smaller than the restore that never converges: each
+                    #     step promotes a few more blocks, nothing has pinned
+                    #     the earlier ones (prepare_load has not run), LRU
+                    #     evicts them to make room for the next, and the request
+                    #     sits in waiting_by_reason{reason=deferred} forever.
+                    #     Measured, with a 9-block tier and a 14.3k prefix.
+                    # A plain HIT lets the scan complete with no deferral; the
+                    # connector then promotes each batch immediately before
+                    # issuing its load, so only one batch is ever resident.
+                    # stream_residency() is what makes that safe.
+                    return LookupResult.HIT
+                promoted = self._initiate_promotion(i, key, req_context)
+                return LookupResult.MISS if not promoted else LookupResult.HIT_PENDING
+"""
+DEFER_SENTINEL = "report the hit and do NOT"
+
+DEFERAPI_OLD = """    @override
+    def prepare_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> LoadStoreSpec:
+"""
+DEFERAPI_NEW = '''    # LOCAL [glm53-offload-streaming]: cached env gate. lookup() is a hot path,
+    # so this is resolved once per class rather than per block.
+    _STREAM_DEFER = None
+
+    def _stream_defer_enabled(self) -> bool:
+        """LOCAL [glm53-offload-streaming]: GLM53_OFFLOAD_STREAM_RESTORE gate."""
+        cls = type(self)
+        if cls._STREAM_DEFER is None:
+            import os as _os
+
+            cls._STREAM_DEFER = _os.environ.get(
+                "GLM53_OFFLOAD_STREAM_RESTORE") == "1"
+        return cls._STREAM_DEFER
+
+    def stream_residency(self, keys, req_context) -> bool:
+        """LOCAL [glm53-offload-streaming]: are `keys` loadable right now?
+
+        Residency is read from the PRIMARY tier. It cannot be read from
+        self.lookup(), which under this patch deliberately reports HIT for blocks
+        that are only on disk -- and cannot be used to DRIVE promotion either,
+        for the same reason: it now returns before _initiate_promotion. So this
+        promotes against the secondary tiers directly.
+
+        _initiate_promotion allocates the primary slot immediately with
+        ref_cnt -1, so a repeat call on the next step sees HIT_PENDING from
+        primary_tier.lookup() rather than allocating twice, and
+        on_schedule_end() -> _flush_pending_promotions() submits the batched job
+        in this same step (the connector drives this before on_schedule_end).
+
+        A promotion that cannot be allocated is simply retried next step, once
+        the in-flight batch's complete_load has returned its blocks to the
+        evictable set. That is the forward-progress argument, and it holds only
+        while a single batch fits in the primary tier.
+
+        Returns True once every key is resident and pinnable by prepare_load().
+        """
+        self._maybe_process_finished_jobs()
+        ready = True
+        for key in keys:
+            primary = self.primary_tier.lookup(key, req_context)
+            if primary is LookupResult.HIT:
+                continue
+            ready = False
+            if primary is LookupResult.HIT_PENDING:
+                continue                # promotion already in flight
+            for i, tier in enumerate(self.secondary_tiers):
+                if not req_context.load_tier_filter.allows(
+                    tier.medium, tier.locality
+                ):
+                    continue
+                if tier.lookup(key, req_context) is LookupResult.HIT:
+                    self._initiate_promotion(i, key, req_context)
+                    break
+        return ready
+
+    @override
+    def prepare_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> LoadStoreSpec:
+'''
+DEFERAPI_SENTINEL = "def stream_residency("
+
+MANAGER_EDITS = [
+    ("mgr:api", DEFERAPI_OLD, DEFERAPI_NEW, DEFERAPI_SENTINEL),
+    ("mgr:lookup-defer", DEFER_OLD, DEFER_NEW, DEFER_SENTINEL),
+]
+
+# --- connector: hold the plan, issue one batch at a time --------------------
+
+SEQ_OLD = """        if not batches:
+            return
+        for idx, (keys, blocks_, gs, bi) in enumerate(batches):
+"""
+SEQ_NEW = """        if not batches:
+            return
+        if self._stream_sequential():
+            # LOCAL [glm53-offload-streaming] step 2b: hold the plan and issue
+            # one batch at a time, promoting each just before its load, so only
+            # one batch need be resident and the tier stops bounding the restore.
+            self._stream_plans[request.request_id] = [
+                self._stream_split_batches(batches), 0]
+            self._stream_advance(request.request_id)
+            return
+        for idx, (keys, blocks_, gs, bi) in enumerate(batches):
+"""
+SEQ_SENTINEL = "step 2b: hold the plan and issue"
+
+ADVANCE_OLD = """    def _issue_chained_load(
+"""
+ADVANCE_NEW = '''    # LOCAL [glm53-offload-streaming]: steps a stalled batch may wait before it
+    # is reported as an error. ~600 steps is tens of seconds of engine time.
+    _STREAM_STALL_STEPS = 600
+    _STREAM_SEQ = None
+    _STREAM_BATCH = None
+
+    def _stream_batch_blocks(self) -> int:
+        """LOCAL [glm53-offload-streaming]: max offload blocks per batch.
+
+        Forward progress requires that ONE batch fit in the primary tier, so the
+        default is half of it -- leaving room for other requests' promotions and
+        stores. A group's batch is otherwise unbounded: at 3584 tokens per
+        offload block a 1M-token restore is ~280 blocks against a 79-block tier.
+        """
+        cls = type(self)
+        if cls._STREAM_BATCH is None:
+            import os as _os
+
+            n = int(_os.environ.get("GLM53_OFFLOAD_STREAM_BATCH_BLOCKS") or 0)
+            if n <= 0:
+                primary = getattr(self.manager, "primary_tier", None)
+                n = max(1, (getattr(primary, "_num_blocks", 0) or 2) // 2)
+            cls._STREAM_BATCH = n
+            logger.info(
+                "KV offload [glm53-offload-streaming]: streaming restores in "
+                "batches of at most %d offload block(s) per KV group", n
+            )
+        return cls._STREAM_BATCH
+
+    def _stream_split_batches(self, batches):
+        """LOCAL [glm53-offload-streaming]: split batches to fit the tier.
+
+        Chunk j of a group's slice covers GPU blocks
+        [j*bpc - off, (j+1)*bpc - off) relative to the slice start, where
+        bpc = self.config.blocks_per_chunk and off = block_indices[gi] % bpc is
+        how far into its offload chunk the slice begins (the scheduler derives
+        the slice from `num_locally_computed_gpu_blocks // blocks_per_chunk`).
+
+        Splitting on a chunk boundary leaves every sub-batch after the first
+        chunk-aligned, so its block_indices -- the field the worker uses to skip
+        part of the first offload block -- is exact. Getting `off` wrong would
+        shift blocks by less than one chunk: KV that loads without error and is
+        silently wrong. The arithmetic is covered by tests/test_stream_split.py.
+        """
+        limit = self._stream_batch_blocks()
+        bpc = self.config.blocks_per_chunk
+        out = []
+        for keys, blocks_, gs, bi in batches:
+            gi = next(i for i, v in enumerate(gs) if v)
+            if len(keys) <= limit:
+                out.append((keys, blocks_, gs, bi))
+                continue
+            off = bi[gi] % bpc
+            for a in range(0, len(keys), limit):
+                b = min(a + limit, len(keys))
+                d_lo = max(0, a * bpc - off)
+                d_hi = min(len(blocks_), b * bpc - off)
+                if d_hi <= d_lo:
+                    continue
+                sub_gs = [0] * len(gs)
+                sub_bi = [0] * len(bi)
+                sub_gs[gi] = d_hi - d_lo
+                sub_bi[gi] = bi[gi] + d_lo
+                out.append((keys[a:b], blocks_[d_lo:d_hi], sub_gs, sub_bi))
+        return out
+
+
+    def _stream_sequential(self) -> bool:
+        """LOCAL [glm53-offload-streaming]: issue restore batches one at a time."""
+        cls = type(self)
+        if cls._STREAM_SEQ is None:
+            import os as _os
+
+            cls._STREAM_SEQ = _os.environ.get(
+                "GLM53_OFFLOAD_STREAM_SEQUENTIAL", "1") == "1"
+        return cls._STREAM_SEQ
+
+    def _stream_advance(self, req_id) -> None:
+        """LOCAL [glm53-offload-streaming]: issue the next batch of a restore.
+
+        Driven every step from build_connector_meta, ahead of on_schedule_end so
+        a promotion started here is submitted in the same step. Cannot deadlock:
+        complete_load returns the previous batch's blocks to the evictable set,
+        so this batch's promotion can reuse them.
+        """
+        plan = self._stream_plans.get(req_id)
+        if not plan:
+            return
+        batches, waits = plan
+        req_status = self._req_status.get(req_id)
+        if req_status is None:
+            # Request went away (finished, preempted, or client aborted).
+            self._stream_plans.pop(req_id, None)
+            return
+        if req_status.transfer_jobs:
+            return                      # a batch is still in flight
+
+        keys, blocks_, gs, bi = batches[0]
+        # Keep every queued key most-recently-used in each tier. A queued batch
+        # holds no reference, so this is what stops another request's stores
+        # evicting it from the disk tier mid-restore.
+        self.manager.touch(
+            [k for b in batches for k in b[0]], req_status.req_context
+        )
+        residency = getattr(self.manager, "stream_residency", None)
+        if residency is not None and not residency(keys, req_status.req_context):
+            plan[1] = waits + 1
+            if plan[1] % self._STREAM_STALL_STEPS == 0:
+                logger.error(
+                    "Request %s: offload restore batch stalled for %d steps "
+                    "waiting on promotion of %d block(s); the request will hang "
+                    "until it is aborted. Blocks were likely evicted from a "
+                    "secondary tier mid-restore.",
+                    req_id, plan[1], len(keys),
+                )
+            return                      # not resident yet; retry next step
+
+        src_spec = self.manager.prepare_load(keys, req_status.req_context)
+        dst_spec = GPULoadStoreSpec(blocks_, group_sizes=gs, block_indices=bi)
+        job_id = self._generate_job_id()
+        self._current_batch_load_jobs[job_id] = TransferJob(
+            req_id=req_id, src_spec=src_spec, dst_spec=dst_spec
+        )
+        req_status.transfer_jobs.add(job_id)
+        self._jobs[job_id] = TransferJobStatus(
+            req_id=req_id,
+            pending_count=self.config.num_workers,
+            keys=set(keys),
+            is_store=False,
+        )
+        batches.pop(0)
+        plan[1] = 0
+        if batches:
+            self._stream_nonfinal_jobs.add(job_id)
+        else:
+            self._stream_plans.pop(req_id, None)
+
+    def _issue_chained_load(
+'''
+ADVANCE_SENTINEL = "def _stream_advance("
+
+PLANS_OLD = """        self._stream_nonfinal_jobs: set[int] = set()
+"""
+PLANS_NEW = """        self._stream_nonfinal_jobs: set[int] = set()
+        # LOCAL [glm53-offload-streaming]: req_id -> [remaining batches, waits].
+        self._stream_plans: dict = {}
+"""
+PLANS_SENTINEL = "_stream_plans: dict = {}"
+
+DRIVE_OLD = """        self._update_req_states(scheduler_output)
+        schedule_end_context = ScheduleEndContext(
+"""
+DRIVE_NEW = """        self._update_req_states(scheduler_output)
+        # LOCAL [glm53-offload-streaming]: drive in-progress streamed restores.
+        # Ahead of on_schedule_end() so promotions initiated here are flushed by
+        # _flush_pending_promotions() in this same step, and every step rather
+        # than only on job completion, since a batch may be waiting on a
+        # promotion that lands between jobs.
+        for _stream_req_id in list(self._stream_plans):
+            self._stream_advance(_stream_req_id)
+
+        schedule_end_context = ScheduleEndContext(
+"""
+DRIVE_SENTINEL = "drive in-progress streamed restores"
+
+SCHED2B_EDITS = [
+    ("sched:plans", PLANS_OLD, PLANS_NEW, PLANS_SENTINEL),
+    ("sched:advance", ADVANCE_OLD, ADVANCE_NEW, ADVANCE_SENTINEL),
+    ("sched:sequential", SEQ_OLD, SEQ_NEW, SEQ_SENTINEL),
+    ("sched:drive", DRIVE_OLD, DRIVE_NEW, DRIVE_SENTINEL),
+]
+
 COMMON_EDITS = [("common:metadata-field", META_OLD, META_NEW, META_SENTINEL)]
 WORKER_EDITS = [
     ("worker:nonfinal-set", INIT_OLD, INIT_NEW, INIT_SENTINEL),
@@ -386,7 +743,8 @@ def main() -> int:
         return 0
     print(f"{MARK} {apply_edits(COMMON, COMMON_EDITS)}")
     print(f"{MARK} {apply_edits(WORKER, WORKER_EDITS)}")
-    print(f"{MARK} {apply_edits(SCHED, SCHED_EDITS)}")
+    print(f"{MARK} {apply_edits(SCHED, SCHED_EDITS + SCHED2B_EDITS)}")
+    print(f"{MARK} {apply_edits(MANAGER, MANAGER_EDITS)}")
     return 0
 
 

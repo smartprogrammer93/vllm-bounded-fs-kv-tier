@@ -52,7 +52,8 @@ Storage, after the layout fixes:
 | `vllm_bounded_fs_tier.py` | Both tier managers: `BoundedFileSystemTierManager` (byte cap + LRU) and `PeerMirroredFileSystemTierManager` (per-rank cascade, own-slot writes) |
 | `peer_kv_agent.py` | Runs in each remote rank's container; performs that rank's own cascade and promotion against its own region and `_r<rank>` files |
 | `patch_offload_nonshareable_groups.py` | Idempotent, sentinel-guarded source edits (seven applied, plus an opt-in experiment knob), gated on `GLM53_OFFLOAD_GROUP_FILTER=1`, fail-closed if upstream drifts |
-| `tests/` | Contract checks against the real vLLM classes, so an engine upgrade fails here rather than silently corrupting KV |
+| `patch_offload_streaming_restore.py` | Streamed restore (twelve scheduler edits, four worker, one metadata, two manager), gated on `GLM53_OFFLOAD_STREAM_RESTORE=1`. Removes tier size as the cap on restore size |
+| `tests/` | Contract checks against the real vLLM classes, so an engine upgrade fails here rather than silently corrupting KV. `test_streaming_patch.py` applies the whole patch chain to pristine upstream sources and checks anchors, ordering, indentation and idempotence offline |
 | `probes/` | The Mamba-necessity experiment, the four W28 gates (addressability, allocator survey, VMM host access, paged bandwidth), and offline unit tests |
 
 ## The patch edits
@@ -229,6 +230,36 @@ measured in seconds.
 
 So the gigabytes are an artefact of the tier being a cache, not a requirement of moving
 bytes to disk.
+
+### Removing the cap — measured
+
+`patch_offload_streaming_restore.py` implements the streamed restore in three steps:
+
+1. **The primitive.** `OffloadingConnectorWorker.get_finished` reports `finished_recving`
+   as soon as *any* of a request's load jobs completes, so the base scheduler would resume
+   the request against a partially-restored prefix. The worker is told which job is the
+   last one and releases the request only then.
+2. **Per-group batching.** The restore is issued as one job per KV group. Valid because
+   `CPUGPUOffloadingWorker._transfer` walks groups positionally and short-circuits on
+   `group_size == 0`, so a job carrying one group works as long as `group_sizes` and
+   `block_indices` keep full length with zeros elsewhere.
+3. **Per-batch promotion.** This is what actually removes the cap. `TieringOffloadingManager
+   .lookup` promoted every hit block *during the prefix scan* and returned `MISS` once the
+   tier was full, truncating the scan — that is the whole mechanism behind
+   `tier size == maximum restorable prefix`. It now reports the hit, and the connector
+   promotes each batch immediately before issuing its load, so only one batch need ever be
+   resident.
+
+It cannot deadlock: `prepare_load` pins a block with `ref_cnt += 1` and `complete_load`
+drops it back to 0, returning it to the evictable set, so batch *k*'s blocks are reusable
+the moment its load completes. Progress is guaranteed as long as a single batch fits.
+
+The residual risk is liveness, not correctness. Once lookup reports the larger hit vLLM has
+committed to it, and a queued batch holds no reference — so another request's stores could
+in principle evict its blocks from the disk tier mid-restore. The driver `touch()`es every
+queued key each step to keep them most-recently-used against exactly that; if a batch
+stalls anyway, that one request hangs, loudly and logged, and self-heals when the client
+disconnects. It never runs the model against a prefix that was not restored.
 
 ## Licence
 
