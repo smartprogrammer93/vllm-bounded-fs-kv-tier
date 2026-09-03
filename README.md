@@ -76,6 +76,12 @@ linearly with depth — so this improves as sessions get deeper:
 | 250k | 251 s | 8.3 s | **30.2×** |
 | 1M | ~1000 s | ~8 s | ~125× *(projected, not measured)* |
 
+> [!NOTE]
+> **These numbers were measured with the streamed restore enabled** (`patch_offload_streaming_restore.py`).
+> That patch is no longer what this stack deploys — see
+> [Update: the primary tier can be the disk tier](#update-the-primary-tier-can-be-the-disk-tier).
+> The results stand as measured; they describe the streamed design, not the current one.
+
 ### The result stock vLLM cannot produce
 
 That 250k restore moves **142 offload blocks through a 79-block CPU tier**. Stock vLLM
@@ -181,6 +187,112 @@ disk tier     100 GiB    ██████████████████�
 100 GiB of disk holds **~6.8M tokens** of restorable context — about **4× the 1.7M-token GPU
 pool** — at a measured 14.8 KB/token (`blocks = 2.00 × chunks + 5.9`, r² clean across the
 125k and 250k runs). That is ~27 sessions at 250k, or ~52 at 125k.
+
+## Update: the primary tier can be the disk tier
+
+Everything above works by making a *small* CPU tier stream a *large* restore. There is a
+simpler way to satisfy the same constraint, and this stack now deploys it instead.
+
+vLLM admits a restore only when **every group's chunks are resident in the primary tier at
+once**. The streamed restore dodges that invariant by reporting a plain `HIT` and making
+chunks resident batch by batch. [MiaAI PR#58](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/58)
+takes the other road: **back the primary tier's staging region with a sparse file on local
+NVMe instead of `/dev/shm`**, so the tier can simply be large enough to satisfy the
+invariant. No promotion step, no `HIT_PENDING` livelock, no tier-size ceiling — and nothing
+to fight the scheduler over.
+
+```mermaid
+flowchart LR
+    subgraph OLD["STREAMED — small RAM tier, batched promotion"]
+        direction TB
+        GA["GPU KV pool"] --> CA["CPU tier<br/><b>2 GiB in /dev/shm</b>"]
+        CA --> DA["disk tier<br/>secondary, LRU"]
+        DA -. "promote per batch<br/>(the patch)" .-> CA
+        CA ==> GA
+    end
+    subgraph NEW["DISK-BACKED — one tier, no promotion"]
+        direction TB
+        GB["GPU KV pool"] --> CB["primary tier<br/><b>sparse file on NVMe</b>"]
+        CB ==> GB
+    end
+    style OLD fill:#f6f8fa,stroke:#d0d7de
+    style NEW fill:#eaffea,stroke:#2a2
+```
+
+`patch_offload_mmap_region.py` does this in four edits, gated on `GLM53_OFFLOAD_MMAP_DIR`:
+point the region at a file, skip the `/dev/shm` free-space check, never pre-fault it (a
+sparse file would otherwise materialise in full), and skip `cudaHostRegister` on a mapping
+that is no longer pinnable host RAM. Unset the variable and vLLM's `/dev/shm` behaviour is
+untouched.
+
+Only PR#58's region half is taken. Its group-exclusion half is not: that job is already done
+by `patch_offload_nonshareable_groups.py`, which additionally carries the region-copies fix
+that PR#58 does not have.
+
+### The sizing rule: the tier must be larger than the GPU pool
+
+This is the part worth stealing even if you take nothing else here.
+
+The GPU pool and the tier are both LRU over the same stream of blocks. So a tier **smaller**
+than the pool holds a strict subset of what the pool already has — the GPU answers first,
+and the tier can never be the thing that serves a restore. Under-sizing it is not a smaller
+cache, it is **no cache**, and it fails silently: stores still succeed and every store-side
+metric still climbs while no restore ever serves.
+
+```text
+tier vs GPU pool, restorable context
+
+pool  1.90M tok  ████████████████████████████
+tier  1.42M tok  █████████████████████·······   100 GB — strict subset, never serves
+tier  3.43M tok  ██████████████████████████████████████████████████   260 GB — 1.8x the pool
+```
+
+Read the row size off your own boot rather than trusting a constant:
+`num_blocks = cpu_bytes_to_use // aligned_kv_bytes_per_chunk`, and vLLM then creates a region
+of exactly `num_blocks × aligned_kv_bytes_per_chunk`. On this stack that row is **54,329,344 B**,
+confirmed twice — 32 GiB → 632 rows, 260 GB → 4785 rows, both exact.
+
+### Where the block ids actually go
+
+The boot-time capacity log explains why the offload footprint per token is what it is:
+
+```text
+ids per 3584-token cached segment across groups: 38
+per group: [1, 0, 1, 1, 1, 1, 33]
+                              ^^ group 6, SlidingWindowSpec, window=2048
+```
+
+**33 of the 38 GPU block ids per segment belong to one sliding-window group** — which the
+offload filter excludes, since a 2048-token window is not worth shipping. Five ids per
+segment are what actually reach the tier. Any capacity estimate that reasons from total GPU
+block ids will therefore be wrong by ~7.6×.
+
+### Status
+
+Deployed and serving: 260 GB tier, KV pool pinned at 1.90× (770 usable block ids,
+1,899,014 tokens), `GLM53_OFFLOAD_STREAM_RESTORE=0`, single tier with no secondary.
+
+> [!WARNING]
+> **Concurrency under this design is being measured and is not yet reported here.** The
+> streamed restore's N ≥ 6 stall is expected to be structurally absent — there is no
+> promotion step left to stall on — but *expected* is not *measured*, and this README does
+> not carry unmeasured claims. The result will be added when the ramp completes.
+
+```jsonc
+// kv_transfer_config under the disk-backed design — note: no secondary_tiers
+{"kv_connector": "OffloadingConnector", "kv_role": "kv_both",
+ "kv_connector_extra_config": {
+   "spec_name": "TieringOffloadingSpec",
+   "cpu_bytes_to_use": 260000000000,   // must exceed the GPU KV pool
+   "eviction_policy": "lru"}}
+```
+
+```sh
+GLM53_OFFLOAD_MMAP_DIR=/kvoffload    # a directory on local NVMe, not /dev/shm
+GLM53_OFFLOAD_GROUP_FILTER=1
+GLM53_OFFLOAD_REGION_COPIES=<GPUs per node>
+GLM53_OFFLOAD_STREAM_RESTORE=0       # superseded by the above
+```
 
 ## How the streamed restore works
 
@@ -298,6 +410,7 @@ Fixing 5 also halved the on-disk footprint — 51.81 MiB → **25.91 MiB** per r
 | File | What it is |
 |---|---|
 | `patch_offload_streaming_restore.py` | The streamed restore: 19 idempotent, sentinel-guarded edits (12 scheduler, 4 worker, 1 metadata, 2 manager), gated on `GLM53_OFFLOAD_STREAM_RESTORE=1` |
+| `patch_offload_mmap_region.py` | Backs the primary tier's staging region with a sparse file on local NVMe instead of `/dev/shm`, gated on `GLM53_OFFLOAD_MMAP_DIR` — ported from [MiaAI PR#58](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/58) |
 | `patch_offload_nonshareable_groups.py` | Fixes defects 1, 2 and 5 plus row sizing, gated on `GLM53_OFFLOAD_GROUP_FILTER=1` |
 | `vllm_bounded_fs_tier.py` | `BoundedFileSystemTierManager` (byte cap + LRU) and `PeerMirroredFileSystemTierManager` (per-rank cascade, own-slot writes — fixes defect 3) |
 | `peer_kv_agent.py` | Runs in each remote rank's container; performs that rank's own cascade and promotion against its own region and `_r<rank>` files |
@@ -353,7 +466,8 @@ GLM53_OFFLOAD_REGION_COPIES=<GPUs per node>   # see note below
   worker uses slot 0 while rows are still sized for `world_size`. Opt-in and clamped — a
   value below the real GPUs-per-node would make co-located workers share a slot and corrupt
   each other.
-* **Clear `/dev/shm/vllm_offload_*.mmap` before launch** (defect 4). Count with a shell
+* **Clear `/dev/shm/vllm_offload_*.mmap` before launch** (defect 4) — or sidestep it with
+  `GLM53_OFFLOAD_MMAP_DIR`, which moves the region out of `/dev/shm` entirely. Count with a shell
   glob, not `ls | wc -l` — `ls` exits 2 on no match, and under `set -e -o pipefail` that
   silently kills the launch the moment the cleanup has nothing left to do.
 * **`PYTHONHASHSEED` must be fixed and identical everywhere**, or vLLM seeds its
@@ -399,16 +513,37 @@ an engine upgrade that moves an API fails there rather than silently corrupting 
   most of the 8.3 s above.
 * **Below ~130k tokens the restore fits a 2 GiB tier**, so stock vLLM serves it too and
   streaming buys nothing. The gain is in deep sessions.
-* **Concurrent deep restores are unmeasured.** Every result here is a single sequential
-  restore. At the default batch size only 2 deep restores hold a full batch at once; further
-  ones retry and serialise rather than fail. Lower `GLM53_OFFLOAD_STREAM_BATCH_BLOCKS` (8 →
-  9 concurrent, ~1.1 s per 1M restore) if you need more.
+* **The streamed restore stalls at N ≥ 6 concurrent deep restores.** An earlier version of
+  this section predicted that surplus restores would "retry and serialise rather than fail".
+  **That prediction was wrong and the measurement contradicted it.** N=2 and N=4 are clean;
+  from N=6 the requests end in `WAITING_FOR_REMOTE_KVS` with the final batch never issued.
+  Bisecting with `GLM53_OFFLOAD_STREAM_RESTORE=0` showed pristine vLLM completing the same
+  wave, which isolates the defect to `patch_offload_streaming_restore.py` — not to vLLM. One
+  real bug was found and fixed on the way (async-lookup `RETRY` churn, fixed with a memo);
+  the stall itself is **not fixed**. Treat the streamed restore as sequential-only.
 * **A residual 1.64× storage overhead remains**: rows are uniform across groups, so a
   2.48 MiB MLA payload still occupies a 25.91 MiB row. Removing it needs ragged per-group
   rows across `config.py`, `cpu/spec.py`, `shared_offload_region.py` and the CPU worker's
   offset arithmetic.
 * **The first restore after a boot behaves as cold**, before the disk cascade has settled.
   Both anomalies across 15 revisits were first-after-boot; don't read one as corruption.
+
+## Credits
+
+This work is built on two upstream efforts, and the disk-backed design is theirs, not ours:
+
+* **[MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks#58](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/58)**
+  ([@MiaAI_lab](https://x.com/MiaAI_lab)) — the disk-backed staging region, the residency
+  invariant stated plainly enough to explain a stall we had been chasing from the wrong end,
+  and the observation that under-sizing the tier fails silently with every store-side metric
+  still climbing.
+* **The Reederey87 GLM-5.3-Flash EXL3 serving kit** ([@Reederey](https://x.com/Reederey)) —
+  the serving recipe this entire stack runs on: the two-node TP=2 bring-up, the overlay
+  patch mechanism (idempotent, sentinel-guarded, fail-closed) that every patch here follows,
+  and the boot-time capacity log that produced the block-id breakdown above.
+
+The out-of-tree tier managers, the group/row-sizing fixes, the streamed restore and the
+measurement harnesses in `probes/` are this repository's own.
 
 ## Licence
 
