@@ -239,13 +239,28 @@ and the tier can never be the thing that serves a restore. Under-sizing it is no
 cache, it is **no cache**, and it fails silently: stores still succeed and every store-side
 metric still climbs while no restore ever serves.
 
-```text
-tier vs GPU pool, restorable context
+The comparison is what matters, not a byte count — and the token capacity of a tier is
+harder to pin down than it looks, so state it as a bound rather than a number:
 
-pool  1.90M tok  ████████████████████████████
-tier  1.42M tok  █████████████████████·······   100 GB — strict subset, never serves
-tier  3.43M tok  ██████████████████████████████████████████████████   260 GB — 1.8x the pool
+```text
+260 GB tier, restorable context under each reading of the row layout
+
+GPU KV pool         1.90M  ████████
+3 rows per segment  5.72M  ████████████████████████
+5 rows per segment  3.43M  ██████████████
+                           every reading clears the pool — which is the point
 ```
+
+Capacity in tokens is `num_blocks x (3584 / rows_per_segment)`. `num_blocks` is exact, but
+`rows_per_segment` is **bounded, not measured**: 1 row/segment is ruled out (a segment's
+measured store exceeds what one row holds), leaving 3-5 on this stack. Size the tier so it
+clears the pool under the *least* favourable reading and the ambiguity stops mattering.
+
+> [!CAUTION]
+> Do not size a tier from a naive sum of KV-group page sizes. That predicts 2.7 KB/token
+> here; the measured store is **31.7 KB/token per rank** — 12x more. Rows are uniform and
+> only partially filled, and the gap is layout, not waste. Measure `kv_offload_store_bytes_total`
+> against tokens actually stored before trusting any figure.
 
 Read the row size off your own boot rather than trusting a constant:
 `num_blocks = cpu_bytes_to_use // aligned_kv_bytes_per_chunk`, and vLLM then creates a region
