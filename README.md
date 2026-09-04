@@ -1,4 +1,4 @@
-# A 60k-token context comes back off disk in 16 seconds instead of 63 seconds of prefill
+# A 60k-token context comes back off disk in 17 seconds instead of 65 seconds of prefill
 
 ![vLLM](https://img.shields.io/badge/vLLM-out--of--tree%2C%20never%20forked-1f6feb)
 ![Hardware](https://img.shields.io/badge/2%C3%97%20DGX%20Spark-GB10%20%C2%B7%20TP%3D2-76b900)
@@ -9,8 +9,8 @@
 ```text
 time to first token, same ~60k prompt, same server
 
-cold prefill  ████████████████████████████████████████████████████  63.2 s
-from disk     █████████████·······································  15.9 s   4.0x
+cold prefill  ████████████████████████████████████████████████████  64.6 s
+from disk     █████████████·······································  16.5 s   3.9x
 ```
 
 …and it still does that with eight sessions restoring at once, with no stalls.
@@ -30,42 +30,71 @@ the GPU pool so a revisit genuinely comes back off disk, then restored in concur
 Every session carries five needles at 10/30/50/70/90% depth **and** a session-unique prefix,
 so a truncated restore and a cross-session mix-up are distinguishable from each other.
 
-| N | wall | needle recall | stalls | tier alloc retries | per-session TTFT vs its own cold prefill |
-|---|---|---|---|---|---|
-| 2 | 18.7 s | 5/5 × 2 | 0 | 0 | 4.0× |
-| 4 | 32.8 s | 5/5 × 4 | 0 | 0 | 2.1× |
-| 6 | 47.3 s | 5/5 × 6 | 0 | 0 | 1.4× |
-| 8 | 75.6 s | 5/5 × 8 | 0 | 0 | 0.9× |
+| N | restore wall | needle recall | stalls | tier alloc retries |
+|---|---|---|---|---|
+| 2 | 18.0 s | 5/5 × 2 | 0 | 0 |
+| 4 | 30.3 s | 5/5 × 4 | 0 | 0 |
+| 6 | 69.6 s | 5/5 × 6 | 0 | 0 |
+| 8 | 80.1 s | 5/5 × 8 | 0 | 0 |
 
 **20 of 20 restores correct. No stalls, no timeouts, no tier pressure at any rung.**
 
-> [!IMPORTANT]
-> **The last column is not a throughput claim, and this repo does not make one.** Each ratio
-> compares a session restored *under concurrent load* against that same session's cold prefill
-> measured *alone on an idle engine*. It is therefore a conservative, apples-to-oranges figure
-> that gets worse as N rises simply because the restore is sharing the engine while its
-> baseline did not.
->
-> The honest comparison — N concurrent restores against N concurrent *cold prefills* — **was
-> not measured**, so no speedup is quoted for it. It is not safe to synthesise one by
-> multiplying the sequential prefill rate by N: this server runs
-> `max_num_batched_tokens=3584` with `long_prefill_token_threshold=1792`, and
-> `scheduler.py` caps each long prefill at that threshold per step. A lone prefill therefore
-> fills only half the batch, and concurrent prefills pack it — so aggregate prefill
-> throughput *rises* with concurrency, by an amount this repo has not measured.
+### The baseline, measured rather than assumed
+
+The comparison that matters is N concurrent restores against N concurrent **cold prefills** of
+the same size, so that was measured too — N unique-from-token-0 documents fired at once, with
+`cached_tokens == 0` asserted on every request so nothing can be a cache hit:
+
+| N | cold-prefill wall | prompt tokens | aggregate |
+|---|---|---|---|
+| 1 | 64.6 s | 63,238 | 979 tok/s |
+| 2 | 122.5 s | 126,972 | 1036 tok/s |
+| 4 | 250.3 s | 253,567 | 1013 tok/s |
+| 6 | 373.9 s | 380,805 | 1019 tok/s |
+| 8 | 503.0 s | 507,744 | 1009 tok/s |
+
+**Aggregate prefill throughput is flat within 5.8% from N=1 to N=8.** Concurrency buys nothing
+on the prefill side — the GPU is already saturated by a single chunk, so extra concurrent
+prefills reorder work without adding any. That is the fact which makes the comparison legitimate.
+
+```text
+restoring N sessions vs prefilling the same N, same size, same boot
+
+N=2   restore ███·················   18.0 s     prefill ████████████████████  122.5 s   6.8x
+N=4   restore ██··················   30.3 s     prefill ████████████████████  250.3 s   8.3x
+N=6   restore ████················   69.6 s     prefill ████████████████████  373.9 s   5.4x
+N=8   restore ███·················   80.1 s     prefill ████████████████████  503.0 s   6.3x
+```
+
+**Call it 5–8×, not a point value.** Two runs of the identical configuration put N=6 at 47.3 s
+and 69.6 s — a 47% spread — while N=2, N=4 and N=8 reproduced within 8% (18.7/18.0, 32.8/30.3,
+75.6/80.1). Quoting a single rung to two significant figures would be overfitting to one run.
+The machine was also not idle during the second run: a harness was serving live traffic against
+it, which is realistic but not controlled.
+
+> [!NOTE]
+> **This claim was published, withdrawn, and then restored — deliberately, and here is why.**
+> It first appeared as 7–8×, computed by multiplying the *sequential* prefill rate by N. That
+> was an assumption presented as a measurement, so it was withdrawn. The stated reason for
+> withdrawing was that `long_prefill_token_threshold=1792` against
+> `max_num_batched_tokens=3584` caps a lone prefill at half the batch, so concurrent prefills
+> should pack it and roughly double aggregate throughput. **Measurement contradicted that:**
+> throughput is flat across N. The scheduler argument was plausible and simply not what this
+> hardware does. The claim is back because the missing half was finally measured — not because
+> the standard for making it moved.
 
 A single restore against a cold prefill of the same prompt, same server:
 
 | | cold prefill | restored from disk |
 |---|---|---|
-| **TTFT** | 63.2 s | **15.9 s — 4.0× faster** |
+| **TTFT** | 64.6 s | **16.5 s — 3.9× faster** |
 | `cached_tokens` | — | **53,760 of ~60,000 (89.6%)** |
 | needle recall | 5/5 | **5/5** |
 
 The 6,240 tokens that are re-prefilled are the Mamba alignment tail: the restorable prefix
 rounds down to an aligned chunk boundary, leaving a remainder bounded by a **constant**
 (≤ 7168 tokens) while the prefill you skip grows with depth. Deeper sessions therefore do
-strictly better than the 4.0× above.
+strictly better than the 3.9× above.
 
 Measured at: tier 260 GB, GPU KV pool pinned to 1,899,014 tokens (770 usable block ids),
 `max_num_seqs=16`. Zero NVRM allocation faults across the entire ramp, host MemFree steady
@@ -284,13 +313,10 @@ edit and produced a server that booted fine and offloaded nothing.
 
 * **Restore depth is bounded by Mamba `align`.** The restorable prefix rounds down to an
   aligned chunk boundary, leaving ≤ 7168 tokens to re-prefill.
-* **No throughput or aggregate-speedup number is claimed.** The concurrent-vs-concurrent
-  comparison (N restores against N cold prefills) was never measured, and it cannot be
-  synthesised from the sequential prefill rate — `long_prefill_token_threshold=1792` against
-  `max_num_batched_tokens=3584` means a lone prefill fills half the batch and concurrent ones
-  pack it, so aggregate prefill throughput rises with N by an unmeasured amount. An earlier
-  revision of this README multiplied the sequential rate by N and published 7–8×; that was an
-  assumption presented as a measurement, and it is withdrawn.
+* **The throughput figure is a range, 5–8×, and one rung is unstable.** N=6 came out at 47.3 s
+  in one run and 69.6 s in another under identical configuration — a 47% spread — while N=2,
+  N=4 and N=8 reproduced within 8%. Do not read any single rung as precise, and note the second
+  run shared the machine with live traffic.
 * **Measured to N=8 concurrent.** Beyond that is untested; there was no tier pressure at N=8
   (zero allocation retries), so the next limit is likely `max_num_seqs` rather than the tier.
 * **Deep single restores are reported at ~60k here.** The alignment tail is a constant, so
