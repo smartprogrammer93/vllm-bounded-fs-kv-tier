@@ -1,4 +1,4 @@
-# Eight agents resume 480k tokens of context in 76 seconds instead of prefilling for 9 minutes
+# A 60k-token context comes back off disk in 16 seconds instead of 63 seconds of prefill
 
 ![vLLM](https://img.shields.io/badge/vLLM-out--of--tree%2C%20never%20forked-1f6feb)
 ![Hardware](https://img.shields.io/badge/2%C3%97%20DGX%20Spark-GB10%20%C2%B7%20TP%3D2-76b900)
@@ -7,11 +7,13 @@
 ![Licence](https://img.shields.io/badge/licence-Apache--2.0-lightgrey)
 
 ```text
-eight agents, ~60k tokens of context each, all resuming at once
+time to first token, same ~60k prompt, same server
 
-prefill it   ████████████████████████████████████████████████████  532 s
-restore it   ███████·············································   75.6 s   7.0x
+cold prefill  ████████████████████████████████████████████████████  63.2 s
+from disk     █████████████·······································  15.9 s   4.0x
 ```
+
+…and it still does that with eight sessions restoring at once, with no stalls.
 
 Out-of-tree fixes and hardening for vLLM's `OffloadingConnector`, developed against
 `vllm 0.1.dev20051+g487ecf187` serving GLM-5.3-Flash (`Glm5Next`, EXL3 4bpw) at 1M context,
@@ -28,23 +30,29 @@ the GPU pool so a revisit genuinely comes back off disk, then restored in concur
 Every session carries five needles at 10/30/50/70/90% depth **and** a session-unique prefix,
 so a truncated restore and a cross-session mix-up are distinguishable from each other.
 
-| N | wall | needle recall | stalls | tier alloc retries | throughput vs prefill |
+| N | wall | needle recall | stalls | tier alloc retries | per-session TTFT vs its own cold prefill |
 |---|---|---|---|---|---|
-| 2 | 18.7 s | 5/5 × 2 | 0 | 0 | **7.1×** |
-| 4 | 32.8 s | 5/5 × 4 | 0 | 0 | **8.1×** |
-| 6 | 47.3 s | 5/5 × 6 | 0 | 0 | **8.4×** |
-| 8 | 75.6 s | 5/5 × 8 | 0 | 0 | **7.0×** |
+| 2 | 18.7 s | 5/5 × 2 | 0 | 0 | 4.0× |
+| 4 | 32.8 s | 5/5 × 4 | 0 | 0 | 2.1× |
+| 6 | 47.3 s | 5/5 × 6 | 0 | 0 | 1.4× |
+| 8 | 75.6 s | 5/5 × 8 | 0 | 0 | 0.9× |
 
 **20 of 20 restores correct. No stalls, no timeouts, no tier pressure at any rung.**
 
-```text
-throughput gain per wave, against the same tokens prefilled at a measured 902 tok/s
-
-N=2  ███████████████████████████████████·······  7.1x
-N=4  ████████████████████████████████████████··  8.1x
-N=6  ██████████████████████████████████████████  8.4x
-N=8  ██████████████████████████████████········  7.0x
-```
+> [!IMPORTANT]
+> **The last column is not a throughput claim, and this repo does not make one.** Each ratio
+> compares a session restored *under concurrent load* against that same session's cold prefill
+> measured *alone on an idle engine*. It is therefore a conservative, apples-to-oranges figure
+> that gets worse as N rises simply because the restore is sharing the engine while its
+> baseline did not.
+>
+> The honest comparison — N concurrent restores against N concurrent *cold prefills* — **was
+> not measured**, so no speedup is quoted for it. It is not safe to synthesise one by
+> multiplying the sequential prefill rate by N: this server runs
+> `max_num_batched_tokens=3584` with `long_prefill_token_threshold=1792`, and
+> `scheduler.py` caps each long prefill at that threshold per step. A lone prefill therefore
+> fills only half the batch, and concurrent prefills pack it — so aggregate prefill
+> throughput *rises* with concurrency, by an amount this repo has not measured.
 
 A single restore against a cold prefill of the same prompt, same server:
 
@@ -58,13 +66,6 @@ The 6,240 tokens that are re-prefilled are the Mamba alignment tail: the restora
 rounds down to an aligned chunk boundary, leaving a remainder bounded by a **constant**
 (≤ 7168 tokens) while the prefill you skip grows with depth. Deeper sessions therefore do
 strictly better than the 4.0× above.
-
-> [!IMPORTANT]
-> **Measure the wave, not the request.** Per-session TTFT decays from 4.0× at N=2 to 0.9× at
-> N=8, which reads like the benefit evaporating. It is not — that ratio compares *concurrent*
-> restores against a *sequential* cold prefill, a baseline nobody gets on a loaded server.
-> Against the same tokens prefilled at the measured rate, the gain is flat at 7–8× across
-> every rung. Concurrency costs per-request latency, not throughput.
 
 Measured at: tier 260 GB, GPU KV pool pinned to 1,899,014 tokens (770 usable block ids),
 `max_num_seqs=16`. Zero NVRM allocation faults across the entire ramp, host MemFree steady
@@ -283,6 +284,13 @@ edit and produced a server that booted fine and offloaded nothing.
 
 * **Restore depth is bounded by Mamba `align`.** The restorable prefix rounds down to an
   aligned chunk boundary, leaving ≤ 7168 tokens to re-prefill.
+* **No throughput or aggregate-speedup number is claimed.** The concurrent-vs-concurrent
+  comparison (N restores against N cold prefills) was never measured, and it cannot be
+  synthesised from the sequential prefill rate — `long_prefill_token_threshold=1792` against
+  `max_num_batched_tokens=3584` means a lone prefill fills half the batch and concurrent ones
+  pack it, so aggregate prefill throughput rises with N by an unmeasured amount. An earlier
+  revision of this README multiplied the sequential rate by N and published 7–8×; that was an
+  assumption presented as a measurement, and it is withdrawn.
 * **Measured to N=8 concurrent.** Beyond that is untested; there was no tier pressure at N=8
   (zero allocation retries), so the next limit is likely `max_num_seqs` rather than the tier.
 * **Deep single restores are reported at ~60k here.** The alignment tail is a constant, so
