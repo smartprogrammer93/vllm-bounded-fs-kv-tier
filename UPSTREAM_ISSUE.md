@@ -267,98 +267,8 @@ larger sessions, re-send it):
 
 ---
 
-# Third defect: a secondary tier silently corrupts KV when the TP group spans nodes
 
-This one produces **wrong output with no error**, so it matters more than the
-other two.
-
-`FileSystemTierManager` is constructed with a memoryview of the *primary* CPU
-tier (`tiering/spec.py`: `primary_kv_view = primary_tier.get_kv_memoryview()`),
-and both directions operate on it alone:
-
-```python
-def submit_store(self, job_metadata):        # CPU -> disk
-    task = functools.partial(batch_store_block, paths, self._primary_kv_view, ...)
-def submit_load(self, job_metadata):         # disk -> CPU
-    batch_load_block(paths, self._primary_kv_view, ...)
-```
-
-That CPU tier is a per-node `/dev/shm` mmap
-(`shared_offload_region.py`: `Created mmap file /dev/shm/vllm_offload_<engine_id>.mmap`),
-and the secondary tier is instantiated **scheduler-side only** — in EngineCore
-and the API server, never in the workers.
-
-So when a tensor-parallel group spans hosts (`--nnodes 2`, one `vllm serve`
-process per node):
-
-* rank 0's shard is cascaded CPU -> disk and promoted disk -> CPU normally;
-* rank 1's CPU region is on the other host and is never touched by any FS tier;
-* the scheduler nonetheless tracks one logical block set and issues the load to
-  every worker (`pending_count = num_workers`);
-* each worker copies CPU -> GPU from **its own** region, so rank 1 copies
-  whatever stale bytes occupy those slots.
-
-The request is then marked as having a valid cached prefix while half the heads
-hold garbage. Measured on our pair: the restore reported `cached_tokens=13312`
-and completed in 5.63 s instead of 16.26 s, and the model emitted 512
-consecutive tokens of neither `content` nor `reasoning_content` — the same
-prompt answers correctly on a cold prefill and on a GPU prefix-cache hit.
-Confirmation that only one rank participates:
-
-```
-head   : 15 GB under kvoffload/, directories ..._r0/...
-worker : kvoffload/ empty, 0 files
-```
-
-`replicated_layout` in `offloading/config.py` already refuses to engage when
-`parallel_config.nnodes_within_dp != 1`, with the comment "Shared /dev/shm mmap
-layout is single-node mp only" — so the single-node assumption is understood in
-one place but not enforced where it silently changes results.
-
-**Suggested fix:** refuse to configure a secondary tier when the KV-parallel
-group spans nodes (fail closed at startup), or instantiate the tier per rank so
-each cascades its own CPU region. A CPU-only tier is unaffected, because the
-scheduler drives every rank's region symmetrically.
-
-### We implemented the per-rank option, out-of-tree
-
-`peer_kv_agent.py` + `PeerMirroredFileSystemTierManager` (in
-`vllm_bounded_fs_tier_peer.py`) make the disk tier correct on a multi-host TP
-group without patching vLLM, using the supported out-of-tree
-`secondary_tiers[].module_path` extension point.
-
-The head-side tier mirrors every cascade and promotion to an agent running in
-each remote rank's container. The agent performs byte-identical I/O against
-*that* rank's own `/dev/shm` region and its own `_r<rank>` files —
-`FileMapper.base_path` excludes rank ("rank lives outside the hash"), so the
-shards are siblings in one namespace. Crucially the head does not release a
-job's `JobResult` until every peer has acknowledged, which keeps disk -> CPU
-ordered before CPU -> GPU on all ranks. A peer failure fails the job, so
-`mark_miss` turns it into a recompute — a wasted prefill instead of a silently
-half-restored prefix.
-
-Measured on the same probe, restores served from disk (8 FS-tier block hits per
-session, both ranks holding 220 `.bin` files / 11 GB):
-
-| session | cold TTFT | restored TTFT | speedup | cached | needle |
-|---|---|---|---|---|---|
-| 1 | 15.45 s | 2.59 s | **6.0x** | 13,312 | OK |
-| 2 | 15.57 s | 2.67 s | **5.8x** | 13,312 | OK |
-
-No cross-session contamination. Before the per-rank cascade the identical
-configuration returned 512 consecutive empty tokens.
-
-Known limitations of our workaround, all easy to lift and none affecting
-correctness: the peer's disk is unbounded (only the head tier enforces
-`max_bytes`, and a peer-side miss degrades to a recompute); each rank stores
-whole block rows, so the other rank's inert half doubles disk usage; and the CPU
-primary tier must be large enough to accept a promotion — a 4 GiB tier against a
-1 GiB GPU pool produced `kv_offload_tiering_promotion_allocation_failures_total`
-and every lookup missed, while 8 GiB worked.
-
----
-
-# Fourth defect: the CPU offload region is never unlinked, and it breaks the next boot
+# Third defect: the CPU offload region is never unlinked, and it breaks the next boot
 
 `SharedOffloadRegion` creates `/dev/shm/vllm_offload_<engine_id>.mmap` and nothing
 removes it when the engine stops or crashes. Every boot mints a fresh
@@ -383,7 +293,7 @@ it by clearing `/dev/shm/vllm_offload_*.mmap` on both hosts before launch.
 
 ---
 
-# Fifth issue: one uniform region row size makes fine-grained groups pathological
+# Fourth issue: one uniform region row size makes fine-grained groups pathological
 
 Not a bug so much as a scaling cliff worth documenting. The offload region uses a
 single row size for every KV group (derived from an average over all blocks), but
