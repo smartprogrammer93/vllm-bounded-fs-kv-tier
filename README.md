@@ -1,246 +1,125 @@
-# Restore a 250k-token KV cache from disk in 8 seconds instead of prefilling it in 250
+# Eight agents resume 480k tokens of context in 76 seconds instead of prefilling for 9 minutes
 
 ![vLLM](https://img.shields.io/badge/vLLM-out--of--tree%2C%20never%20forked-1f6feb)
 ![Hardware](https://img.shields.io/badge/2%C3%97%20DGX%20Spark-GB10%20%C2%B7%20TP%3D2-76b900)
 ![Context](https://img.shields.io/badge/context-1M%20tokens-8250df)
-![Restore](https://img.shields.io/badge/250k%20restore-8.3s%20vs%20250.6s-2da44e)
+![Concurrency](https://img.shields.io/badge/clean%20to-N%3D8%20concurrent-2da44e)
 ![Licence](https://img.shields.io/badge/licence-Apache--2.0-lightgrey)
 
-**Time to first token, same 250k-token prompt, same server:**
-
 ```text
-cold prefill   ██████████████████████████████████████████████████  250.6 s
-from disk      ██················································    8.3 s   30.2x faster
+eight agents, ~60k tokens of context each, all resuming at once
+
+prefill it   ████████████████████████████████████████████████████  532 s
+restore it   ███████·············································   75.6 s   7.0x
 ```
 
 Out-of-tree fixes and hardening for vLLM's `OffloadingConnector`, developed against
 `vllm 0.1.dev20051+g487ecf187` serving GLM-5.3-Flash (`Glm5Next`, EXL3 4bpw) at 1M context,
 TP=2 across two NVIDIA DGX Spark (GB10) hosts.
 
-Everything loads through vLLM's supported extension points — the two tier managers via
-`secondary_tiers[].module_path`, the rest as an idempotent start-time source patch. vLLM
-itself is never forked.
+The KV cache tier lives in a **sparse file on local NVMe** rather than in RAM, so it can be
+larger than the GPU pool it backs. Everything loads through vLLM's supported extension
+points as idempotent start-time source patches. vLLM itself is never forked.
 
 ## Results
 
-A **250k-token session**, evicted by flushing the entire 1.7M-token GPU pool, then
-revisited so the KV genuinely comes back off disk. Answers verified against five needles at
-10/30/50/70/90% depth, so a partially-restored prefix cannot pass as a full one.
+Twenty sessions of ~60k tokens, each evicted by pushing **2.00M tokens of filler** through
+the GPU pool so a revisit genuinely comes back off disk, then restored in concurrent waves.
+Every session carries five needles at 10/30/50/70/90% depth **and** a session-unique prefix,
+so a truncated restore and a cross-session mix-up are distinguishable from each other.
+
+| N | wall | needle recall | stalls | tier alloc retries | throughput vs prefill |
+|---|---|---|---|---|---|
+| 2 | 18.7 s | 5/5 × 2 | 0 | 0 | **7.1×** |
+| 4 | 32.8 s | 5/5 × 4 | 0 | 0 | **8.1×** |
+| 6 | 47.3 s | 5/5 × 6 | 0 | 0 | **8.4×** |
+| 8 | 75.6 s | 5/5 × 8 | 0 | 0 | **7.0×** |
+
+**20 of 20 restores correct. No stalls, no timeouts, no tier pressure at any rung.**
+
+```text
+throughput gain per wave, against the same tokens prefilled at a measured 902 tok/s
+
+N=2  ███████████████████████████████████·······  7.1x
+N=4  ████████████████████████████████████████··  8.1x
+N=6  ██████████████████████████████████████████  8.4x
+N=8  ██████████████████████████████████········  7.0x
+```
+
+A single restore against a cold prefill of the same prompt, same server:
 
 | | cold prefill | restored from disk |
 |---|---|---|
-| **TTFT** | **250.6 s** | **8.3 s — 30.2× faster** |
-| `cached_tokens` | — | **243,712 of 249,638 (97.6%)** |
+| **TTFT** | 63.2 s | **15.9 s — 4.0× faster** |
+| `cached_tokens` | — | **53,760 of ~60,000 (89.6%)** |
 | needle recall | 5/5 | **5/5** |
 
-```text
-how much of the 249,638-token prompt came back off disk
-
-restored from disk  ████████████████████████████████████████████████·  243,712  (97.6%)
-re-prefilled        ·················································    5,926   (2.4%)
-```
-
-Where those 8.3 s go — **the restore itself is about half a second**:
-
-```mermaid
-pie showData
-    title Warm TTFT of a 250k restore, in seconds
-    "Re-prefill the tail Mamba alignment leaves" : 5.95
-    "Tokenise + first-token decode + scheduling" : 1.80
-    "Disk read, 1865 MiB at 5.34 GB/s" : 0.37
-    "Streaming batches, 6 at ~15 ms" : 0.09
-    "CPU to GPU, 3675 MiB at 48.7 GB/s" : 0.07
-```
-
-| | |
-|---|---|
-| re-prefilling the 5,926-token tail Mamba alignment leaves behind | 5.95 s |
-| disk read, 1865 MiB @ **5.34 GB/s** | 0.37 s |
-| CPU→GPU, 3675 MiB @ **48.7 GB/s** | 0.07 s |
-| 6 streaming batches @ ~15 ms | 0.09 s |
-| tokenisation, first-token decode, scheduling | ~1.8 s |
-
-The leftover tail is bounded by a constant (≤ 7168 tokens), while the prefill you skip grows
-linearly with depth — so this improves as sessions get deeper:
-
-```text
-         cold prefill                                 restored
-  125k   ██████··································   148 s   █·······   8.4 s    17.6x
-  250k   ██████████······························   251 s   █·······   8.3 s    30.2x
-    1M   ████████████████████████████████████████  ~1000 s  █·······  ~8 s     ~125x  (projected)
-```
-
-| session | cold prefill | restored | speedup |
-|---|---|---|---|
-| 125k | 148 s | 8.4 s | **17.6×** |
-| 250k | 251 s | 8.3 s | **30.2×** |
-| 1M | ~1000 s | ~8 s | ~125× *(projected, not measured)* |
-
-> [!NOTE]
-> **These numbers were measured with the streamed restore enabled** (`patch_offload_streaming_restore.py`).
-> That patch is no longer what this stack deploys — see
-> [Update: the primary tier can be the disk tier](#update-the-primary-tier-can-be-the-disk-tier).
-> The results stand as measured; they describe the streamed design, not the current one.
-
-### The result stock vLLM cannot produce
-
-That 250k restore moves **142 offload blocks through a 79-block CPU tier**. Stock vLLM
-promotes every hit block *during* the prefix scan, so its 80th promotion fails, `lookup`
-returns `MISS`, and the scan truncates there.
-
-```mermaid
-flowchart TD
-    S["Prefix scan asks: is this block offloaded?"] --> H{"Found in the disk tier?"}
-    H -- no --> M0["MISS, scan ends here"]
-    H -- yes --> P{"Promote it into the CPU tier now?"}
-
-    P -- "STOCK: yes, during the scan" --> F{"Did the tier have room?"}
-    F -- "yes" --> HP["HIT_PENDING: scan defers to next step.<br/>Nothing has pinned this block yet,<br/>so LRU evicts it to make room for the next.<br/>Never converges."]
-    F -- "no, tier full" --> MI["MISS: scan truncates.<br/>Tier size becomes the restore ceiling."]
-    HP --> DEAD["Request stuck in<br/>waiting_by_reason=deferred"]
-    MI --> WASTE["233 MiB read off disk,<br/>0 bytes delivered to the GPU"]
-
-    P -- "STREAMED: no, defer it" --> HIT["Report a plain HIT.<br/>Scan completes with zero deferrals."]
-    HIT --> BATCH["Connector promotes each batch<br/>immediately before its load.<br/>Only ONE batch is ever resident."]
-    BATCH --> WIN["142 blocks delivered<br/>through a 79-block tier"]
-
-    style WASTE fill:#f8d7da,stroke:#c33
-    style DEAD fill:#f8d7da,stroke:#c33
-    style WIN fill:#d4edda,stroke:#2a2
-```
-
-An A/B with everything else held identical — same 9-block tier, same documents, same disk
-contents, same GPU pool — toggling only `GLM53_OFFLOAD_STREAM_RESTORE`:
-
-| per revisit | stock | streamed |
-|---|---|---|
-| read from disk | 233 MiB | 256 MiB |
-| **delivered to GPU** | **0 MiB** | **256 MiB** |
-| load jobs issued | **0** | 10 |
-| `cached_tokens` | **0** | **7168** |
-| restores that happened | **0 / 6** | **6 / 6** |
+The 6,240 tokens that are re-prefilled are the Mamba alignment tail: the restorable prefix
+rounds down to an aligned chunk boundary, leaving a remainder bounded by a **constant**
+(≤ 7168 tokens) while the prefill you skip grows with depth. Deeper sessions therefore do
+strictly better than the 4.0× above.
 
 > [!IMPORTANT]
-> Stock does not merely restore *less* — **it pays the full disk read and then throws all of
-> it away.** 233 MiB is exactly the whole tier: the scan promotes until the tier is full, the
-> next promotion fails, and the truncated hit falls below the model's Mamba alignment unit,
-> so it rounds to nothing and **no load job is ever issued**. Identical to the byte on all
-> six revisits.
+> **Measure the wave, not the request.** Per-session TTFT decays from 4.0× at N=2 to 0.9× at
+> N=8, which reads like the benefit evaporating. It is not — that ratio compares *concurrent*
+> restores against a *sequential* cold prefill, a baseline nobody gets on a loaded server.
+> Against the same tokens prefilled at the measured rate, the gain is flat at 7–8× across
+> every rung. Concurrency costs per-request latency, not throughput.
 
-Repeated at 15.6k with 3 trials: **9/9 restores, 5/5 needle recall on 9 of 9, 0 stalls.**
+Measured at: tier 260 GB, GPU KV pool pinned to 1,899,014 tokens (770 usable block ids),
+`max_num_seqs=16`. Zero NVRM allocation faults across the entire ramp, host MemFree steady
+at 1.1–1.3 GiB under eight concurrent deep restores.
 
-### In production, under real load
+## How it works
 
-The numbers above are controlled experiments. This is the same build serving a live
-multi-agent coding workload — 18 concurrent agents, contexts from 26k to 205k, nobody
-running a benchmark:
+vLLM admits a restore only when **every KV group's chunks are resident in the primary tier
+at once**. That invariant is what makes the tier's size the binding constraint — and the
+straightforward way to satisfy it is to make the tier big, which RAM will not allow on a
+machine whose RAM is already the GPU's.
 
-| | |
-|---|---|
-| GPU KV pool | **98% used**, 29 preemptions |
-| requests | 7 running, 7 waiting (some on `capacity`, not just `deferred`) |
-| **offload load jobs** | **722**, climbing ~100/min |
-| **tokens served from disk** | **1.38M** |
-| disk hit rate, sampled under pressure | **29.5%** of everything the GPU cache missed |
-
-Those are tokens the agents would otherwise have re-prefilled.
-
-### It engages from cache turnover, not from pool saturation
-
-This is the part that is easy to get wrong, and we got it wrong first: you do **not** have to
-fill the pool for offload to matter. Earlier the same day, with the pool at **47% and zero
-preemptions**, 63.4% of prefix lookups were already missing the GPU cache and disk was
-already serving them.
-
-`BlockPool.free_blocks` appends *hashed* blocks to the back of the free queue and
-`get_new_blocks` pops from the front, so **every allocation recycles the oldest cached
-block** regardless of how full the pool is. Eviction is paced by allocation rate, not by
-occupancy. With 13.2M prompt tokens through a 1.70M-token pool — **7.8× turnover** — every
-cached prefix had been recycled several times over.
-
-So the useful sizing question is not "will my working set exceed the pool" but "how much
-prefix re-use is my workload losing to turnover".
-
-### Reading the metrics: three that do not mean what they say
-
-Each of these produced a wrong conclusion before it was caught:
-
-| Metric | What it looks like | What it is |
-|---|---|---|
-| `kv_cache_usage_perc` | how much cache is retained | blocks allocated to **currently running** requests. 47% does not mean 53% of your cached prefixes survive |
-| `prompt_tokens_total` | prefill work done | **all** prompt tokens submitted, cache hits included. In one window 70,656 of 73,376 were cached — real work was 45 tok/s, not 1,223. Use `prefix_cache_queries − hits` |
-| `external_prefix_cache_hits / queries` | disk's hit rate | denominator includes **first-time content that can never hit**. Cumulative read 12.2%; sampled under real pressure, 29.5% |
-
-And one label: `kv_offload_tiering_*` tags secondary tiers `tier="<idx>:<ClassName>"`, not
-`tier="<idx>"`. Matching on `tier="0"` reports **zero disk hits for a run that took 155** —
-the primary is `tier="0:primary"`. Match by excluding the primary, not by including an index.
-
-### Capacity
-
-```text
-restorable context, in tokens
-
-GPU KV pool    18.8 GB   ████████························  1.70M
-disk tier     100 GiB    ████████████████████████████████  6.80M   ~4x the pool
-```
-
-100 GiB of disk holds **~6.8M tokens** of restorable context — about **4× the 1.7M-token GPU
-pool** — at a measured 14.8 KB/token (`blocks = 2.00 × chunks + 5.9`, r² clean across the
-125k and 250k runs). That is ~27 sessions at 250k, or ~52 at 125k.
-
-## Update: the primary tier can be the disk tier
-
-Everything above works by making a *small* CPU tier stream a *large* restore. There is a
-simpler way to satisfy the same constraint, and this stack now deploys it instead.
-
-vLLM admits a restore only when **every group's chunks are resident in the primary tier at
-once**. The streamed restore dodges that invariant by reporting a plain `HIT` and making
-chunks resident batch by batch. [MiaAI PR#58](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/58)
-takes the other road: **back the primary tier's staging region with a sparse file on local
-NVMe instead of `/dev/shm`**, so the tier can simply be large enough to satisfy the
-invariant. No promotion step, no `HIT_PENDING` livelock, no tier-size ceiling — and nothing
-to fight the scheduler over.
+So the staging region is backed by a **sparse file on local NVMe** instead of `/dev/shm`.
+Four edits, gated on `GLM53_OFFLOAD_MMAP_DIR`: point the region at a file, skip the
+`/dev/shm` free-space check, never pre-fault it (a sparse file would otherwise materialise in
+full), and skip `cudaHostRegister` on a mapping that is no longer pinnable host RAM. Unset
+the variable and vLLM's `/dev/shm` behaviour is untouched.
 
 ```mermaid
 flowchart LR
-    subgraph OLD["STREAMED — small RAM tier, batched promotion"]
+    subgraph N1["HEAD NODE — DGX Spark GB10, rank 0"]
         direction TB
-        GA["GPU KV pool"] --> CA["CPU tier<br/><b>2 GiB in /dev/shm</b>"]
-        CA --> DA["disk tier<br/>secondary, LRU"]
-        DA -. "promote per batch<br/>(the patch)" .-> CA
-        CA ==> GA
+        G1["GPU KV pool<br/><b>1.90M tokens</b><br/>20.97 GB pinned"]
+        C1["Primary tier<br/><b>260 GB sparse file, NVMe</b><br/>4785 rows · LRU"]
     end
-    subgraph NEW["DISK-BACKED — one tier, no promotion"]
+    subgraph N2["PEER NODE — GB10, rank 1"]
         direction TB
-        GB["GPU KV pool"] --> CB["primary tier<br/><b>sparse file on NVMe</b>"]
-        CB ==> GB
+        G2["GPU KV pool<br/>rank 1"]
+        C2["Primary tier<br/><b>own region, own file</b>"]
     end
-    style OLD fill:#f6f8fa,stroke:#d0d7de
-    style NEW fill:#eaffea,stroke:#2a2
+    G1 -- "store" --> C1
+    C1 == "restore" ==> G1
+    G2 -- "store" --> C2
+    C2 == "restore" ==> G2
+
+    classDef gpu  fill:#dbeafe,stroke:#3b82f6,stroke-width:2px
+    classDef disk fill:#fed7aa,stroke:#ea580c,stroke-width:2px
+    class G1,G2 gpu
+    class C1,C2 disk
+    style N1 fill:#f6f8fa,stroke:#d0d7de,stroke-width:1px
+    style N2 fill:#f6f8fa,stroke:#d0d7de,stroke-width:1px
 ```
 
-`patch_offload_mmap_region.py` does this in four edits, gated on `GLM53_OFFLOAD_MMAP_DIR`:
-point the region at a file, skip the `/dev/shm` free-space check, never pre-fault it (a
-sparse file would otherwise materialise in full), and skip `cudaHostRegister` on a mapping
-that is no longer pinnable host RAM. Unset the variable and vLLM's `/dev/shm` behaviour is
-untouched.
-
-Only PR#58's region half is taken. Its group-exclusion half is not: that job is already done
-by `patch_offload_nonshareable_groups.py`, which additionally carries the region-copies fix
-that PR#58 does not have.
+Each rank owns its own region and its own file. There is one tier, no promotion step between
+tiers, and nothing to cascade or mirror between hosts.
 
 ### The sizing rule: the tier must be larger than the GPU pool
 
 This is the part worth stealing even if you take nothing else here.
 
-The GPU pool and the tier are both LRU over the same stream of blocks. So a tier **smaller**
-than the pool holds a strict subset of what the pool already has — the GPU answers first,
-and the tier can never be the thing that serves a restore. Under-sizing it is not a smaller
-cache, it is **no cache**, and it fails silently: stores still succeed and every store-side
-metric still climbs while no restore ever serves.
-
-The comparison is what matters, not a byte count — and the token capacity of a tier is
-harder to pin down than it looks, so state it as a bound rather than a number:
+The GPU pool and the tier are both LRU over the same stream of blocks. A tier **smaller**
+than the pool therefore holds a strict subset of what the pool already has — the GPU answers
+first, and the tier can never be the thing that serves a restore. Under-sizing it is not a
+smaller cache, it is **no cache**, and it fails silently: stores still succeed and every
+store-side metric still climbs while no restore ever serves.
 
 ```text
 260 GB tier, restorable context under each reading of the row layout
@@ -251,25 +130,29 @@ GPU KV pool         1.90M  ████████
                            every reading clears the pool — which is the point
 ```
 
-Capacity in tokens is `num_blocks x (3584 / rows_per_segment)`. `num_blocks` is exact, but
-`rows_per_segment` is **bounded, not measured**: 1 row/segment is ruled out (a segment's
-measured store exceeds what one row holds), leaving 3-5 on this stack. Size the tier so it
+Capacity in tokens is `num_blocks × (3584 / rows_per_segment)`. `num_blocks` is exact:
+`cpu_bytes_to_use // aligned_kv_bytes_per_chunk`, and vLLM then creates a region of exactly
+`num_blocks × aligned_kv_bytes_per_chunk`. On this stack that row is **54,329,344 B**,
+confirmed twice — 32 GiB → 632 rows, 260 GB → 4785 rows, both exact.
+
+`rows_per_segment` is **bounded, not measured**: 1 row/segment is ruled out, since a
+segment's measured store exceeds what one row can hold, leaving 3–5 here. Size the tier so it
 clears the pool under the *least* favourable reading and the ambiguity stops mattering.
 
 > [!CAUTION]
 > Do not size a tier from a naive sum of KV-group page sizes. That predicts 2.7 KB/token
-> here; the measured store is **31.7 KB/token per rank** — 12x more. Rows are uniform and
-> only partially filled, and the gap is layout, not waste. Measure `kv_offload_store_bytes_total`
-> against tokens actually stored before trusting any figure.
+> here; the measured store is **31.7 KB/token per rank** — 12× more. Rows are uniform and
+> only partially filled, and the gap is layout, not waste. Measure
+> `kv_offload_store_bytes_total` against tokens actually stored before trusting any figure.
 
-Read the row size off your own boot rather than trusting a constant:
-`num_blocks = cpu_bytes_to_use // aligned_kv_bytes_per_chunk`, and vLLM then creates a region
-of exactly `num_blocks × aligned_kv_bytes_per_chunk`. On this stack that row is **54,329,344 B**,
-confirmed twice — 32 GiB → 632 rows, 260 GB → 4785 rows, both exact.
+In the run above the tier absorbed **3.20M tokens** (1.20M seeded + 2.00M filler) with the
+*oldest* session still restoring in full, which is what tightens the bound to
+`rows_per_segment ≤ 5.36`. That cost **88 G of actual disk** per node — well under the
+address space reserved, because unused row tails stay sparse holes.
 
 ### Where the block ids actually go
 
-The boot-time capacity log explains why the offload footprint per token is what it is:
+The boot-time capacity log explains the offload footprint per token:
 
 ```text
 ids per 3584-token cached segment across groups: 38
@@ -279,193 +162,48 @@ per group: [1, 0, 1, 1, 1, 1, 33]
 
 **33 of the 38 GPU block ids per segment belong to one sliding-window group** — which the
 offload filter excludes, since a 2048-token window is not worth shipping. Five ids per
-segment are what actually reach the tier. Any capacity estimate that reasons from total GPU
-block ids will therefore be wrong by ~7.6×.
+segment are what actually reach the tier. Any capacity estimate reasoning from total GPU
+block ids will be wrong by ~7.6×.
 
-### Status
-
-Deployed and serving: 260 GB tier, KV pool pinned at 1.90× (770 usable block ids,
-1,899,014 tokens), `GLM53_OFFLOAD_STREAM_RESTORE=0`, single tier with no secondary.
-
-### Concurrency: measured, N = 2 to 8
-
-The streamed restore stalls from N = 6. Under the disk-backed tier the same ramp is clean to
-N = 8 — 20 sessions of ~60k tokens, each evicted by pushing 2.00M tokens of filler through
-the pool, each carrying five needles at 10/30/50/70/90% depth and a session-unique prefix so
-a truncated restore and a cross-session mix-up are distinguishable:
-
-| N | wall | needle recall | stalls | tier alloc retries | throughput vs cold |
-|---|---|---|---|---|---|
-| 2 | 18.7 s | 5/5 × 2 | 0 | 0 | **7.1×** |
-| 4 | 32.8 s | 5/5 × 4 | 0 | 0 | **8.1×** |
-| 6 | 47.3 s | 5/5 × 6 | 0 | 0 | **8.4×** |
-| 8 | 75.6 s | 5/5 × 8 | 0 | 0 | **7.0×** |
-
-**20 of 20 restores correct, no stalls, no tier pressure at any rung.**
-
-```text
-throughput gain per wave, vs prefilling the same tokens at 902 tok/s
-
-N=2  ███████████████████████████████████·······  7.1x
-N=4  ████████████████████████████████████████··  8.1x
-N=6  ██████████████████████████████████████████  8.4x
-N=8  ██████████████████████████████████·······   7.0x
-```
-
-> [!IMPORTANT]
-> **Measure the wave, not the request.** Per-session TTFT decays from 4.0× at N=2 to 0.9× at
-> N=8, which looks like the benefit evaporating. It is not: that ratio compares *concurrent*
-> restores against a *sequential* cold prefill — a baseline nobody gets on a loaded server.
-> Against the same tokens prefilled at the measured rate, the gain is flat at 7–8× across
-> every rung. Concurrency costs per-request latency, not throughput.
-
-Two counters read as failures here and are not. `disk_hits` stays 0 because the probe counts
-tiers *excluding* the primary and there is now only `tier="0:primary"` — the tier **is** the
-disk. Transfer shows up instead as `CPU->GPU +7433 MiB` over 16 load jobs at N=8. And every
-session restores exactly **53,760 of ~60,000 tokens (89.6%)**, the remaining 6,240 being the
-Mamba alignment tail, inside the ≤ 7168 bound.
-
-The tier absorbed 3.20M tokens (1.20M seeded + 2.00M filler) with the *oldest* session still
-restoring in full, which tightens the row bound above to `rows_per_segment ≤ 5.36`.
-
-```jsonc
-// kv_transfer_config under the disk-backed design — note: no secondary_tiers
-{"kv_connector": "OffloadingConnector", "kv_role": "kv_both",
- "kv_connector_extra_config": {
-   "spec_name": "TieringOffloadingSpec",
-   "cpu_bytes_to_use": 260000000000,   // must exceed the GPU KV pool
-   "eviction_policy": "lru"}}
-```
-
-```sh
-GLM53_OFFLOAD_MMAP_DIR=/kvoffload    # a directory on local NVMe, not /dev/shm
-GLM53_OFFLOAD_GROUP_FILTER=1
-GLM53_OFFLOAD_REGION_COPIES=<GPUs per node>
-GLM53_OFFLOAD_STREAM_RESTORE=0       # superseded by the above
-```
-
-## How the streamed restore works
-
-`patch_offload_streaming_restore.py`, gated on `GLM53_OFFLOAD_STREAM_RESTORE=1`:
-
-1. **Let a restore span several load jobs.** `OffloadingConnectorWorker.get_finished`
-   reports `finished_recving` as soon as *any* of a request's load jobs completes, which
-   would resume the request against a partially-restored prefix. The worker is now told
-   which job is the last and releases the request only then.
-2. **One job per KV group.** Valid because `CPUGPUOffloadingWorker._transfer` walks groups
-   positionally and short-circuits on `group_size == 0`, so a job carrying a single group
-   works as long as `group_sizes` and `block_indices` keep full length with zeros elsewhere.
-3. **Promote per batch.** This is what removes the cap. `TieringOffloadingManager.lookup`
-   promoted during the prefix scan, and **both** outcomes tied restore size to tier size:
-   `MISS` truncates the scan, and `HIT_PENDING` defers it into a livelock where LRU evicts
-   blocks promoted a step earlier, because `prepare_load` has not pinned them yet. So
-   `lookup` now reports a plain HIT and does not promote at all; the connector promotes each
-   batch immediately before issuing its load, and only one batch is ever resident.
-
-```mermaid
-sequenceDiagram
-    participant Sch as Scheduler
-    participant Mgr as TieringOffloadingManager
-    participant Tier as CPU tier, 79 blocks
-    participant W as GPU worker
-
-    Note over Sch,W: batch k, then batch k+1. Only one is ever resident.
-    Sch->>Mgr: stream_residency(batch k keys)
-    Mgr->>Tier: promote from disk
-    Tier-->>Mgr: resident
-    Sch->>Mgr: prepare_load(batch k)
-    Mgr->>Tier: ref_cnt += 1, now pinned and not evictable
-    Sch->>W: load job, marked NOT final
-    W-->>Sch: done, but finished_recving is withheld
-    Sch->>Mgr: complete_load(batch k)
-    Mgr->>Tier: ref_cnt drops to 0, back in the evictable set
-    Note over Tier: batch k blocks are reusable again,<br/>which is exactly what batch k+1 needs
-    Sch->>Mgr: stream_residency(batch k+1 keys)
-    Mgr->>Tier: promote, reusing batch k slots
-    Sch->>W: load job, marked final
-    W-->>Sch: finished_recving, request resumes
-```
-
-**It cannot deadlock.** `prepare_load` pins a block with `ref_cnt += 1` and `complete_load`
-drops it back to 0, returning it to the evictable set — so batch *k*'s blocks are reusable
-the moment its load completes. Progress is guaranteed as long as a single batch fits, which
-is why batches are capped at half the tier (`GLM53_OFFLOAD_STREAM_BATCH_BLOCKS`, 0 = auto).
-
-> [!WARNING]
-> **The residual risk is liveness, not correctness.** Once `lookup` reports the larger hit
-> vLLM has committed to it, and a queued batch holds no reference — so another request's
-> stores could in principle evict its blocks from the disk tier mid-restore. The driver
-> `touch()`es every queued key each step to keep them most-recently-used against that. A
-> batch that stalls anyway hangs *that one request*, logged as an `ERROR`, and self-heals
-> when the client disconnects. It never runs the model against a prefix that was not
-> restored.
-
-## The data path
-
-```mermaid
-flowchart LR
-    subgraph N1["HEAD NODE — DGX Spark GB10"]
-        direction LR
-        G1["GPU KV pool<br/><b>1.70M tokens</b><br/>18.8 GB"]
-        C1["CPU staging tier<br/><b>79 blocks / 2 GiB</b><br/><i>a buffer, not a cache</i>"]
-        D1["Disk tier<br/><b>100 GiB cap, LRU</b><br/>~6.8M tokens"]
-    end
-    subgraph N2["PEER NODE — rank 1"]
-        direction LR
-        C2["CPU region<br/><i>own slot only</i>"]
-        D2["Disk shard<br/><i>_r1 files</i>"]
-    end
-
-    G1 -- "store<br/>48.7 GB/s" --> C1
-    C1 -- "cascade" --> D1
-    D1 -- "read<br/>5.34 GB/s" --> C1
-    C1 == "restore 48.7 GB/s<br/><b>one batch at a time</b>" ==> G1
-    C1 -. "peer agent" .-> C2
-    C2 --> D2
-    D1 -. "LRU deletions<br/>mirrored" .-> D2
-
-    classDef gpu  fill:#dbeafe,stroke:#3b82f6,stroke-width:2px
-    classDef cpu  fill:#ede9fe,stroke:#7c3aed,stroke-width:2px
-    classDef disk fill:#fed7aa,stroke:#ea580c,stroke-width:2px
-    class G1 gpu
-    class C1,C2 cpu
-    class D1,D2 disk
-    style N1 fill:#f6f8fa,stroke:#d0d7de,stroke-width:1px
-    style N2 fill:#f6f8fa,stroke:#d0d7de,stroke-width:1px
-```
-
-Each rank writes only its **own** slot of the shared region and owns its own `_r<rank>`
-files. Getting that wrong is upstream defect 3: a secondary tier that only ever touches the
-local node's region restores zeros for every remote rank — silent KV corruption, which is
-how it was found.
-
-## Five upstream defects found on the way
+## Four upstream defects found on the way
 
 | # | Defect | Symptom |
 |---|---|---|
 | 1 | The divisibility assert covers KV groups that opt out of prefix caching | `OffloadingConnector` cannot initialise at all |
 | 2 | Those same groups stay in the hit lookup | offload is **write-only**: `CPU_to_GPU` stays at exactly 0 forever |
-| 3 | A secondary tier only ever touches the local node's CPU region | **silent KV corruption** when the TP group spans hosts |
-| 4 | The `/dev/shm` region is never unlinked | orphans accumulate until the startup memory gate fails |
-| 5 | One uniform region row size for every group | 7× storage blow-up, ~90% of it from one drafter group |
+| 3 | The staging region is never unlinked | orphans accumulate across restarts — a stale 32 GiB region survived a reboot here, and moving the region to disk does not fix it, only relocates it |
+| 4 | One uniform region row size for every group | 7× storage blow-up, ~90% of it from one drafter group |
 
-Two of these produce wrong output with no error. Exact code sites and suggested fixes are in
-[`UPSTREAM_ISSUE.md`](UPSTREAM_ISSUE.md).
+Defect 2 produces wrong behaviour with no error at all. Exact code sites and suggested fixes
+are in [`UPSTREAM_ISSUE.md`](UPSTREAM_ISSUE.md).
 
-Fixing 5 also halved the on-disk footprint — 51.81 MiB → **25.91 MiB** per region row, and
-75.8 → **37.6 KB/token** on the same workload.
+Fixing 4 also halved the on-disk footprint — 51.81 MiB → **25.91 MiB** per region row.
+
+## Reading the metrics: several that do not mean what they say
+
+Each of these produced a wrong conclusion before it was caught:
+
+| Metric | What it looks like | What it is |
+|---|---|---|
+| `kv_cache_usage_perc` | how much cache is retained | blocks allocated to **currently running** requests. 47% does not mean 53% of your cached prefixes survive |
+| `kv_offload_cpu_cache_usage_perc` | tier occupancy | same trap — it read 0.0005 immediately after 540k tokens had been stored |
+| `prompt_tokens_total` | prefill work done | **all** prompt tokens submitted, cache hits included. In one window 70,656 of 73,376 were cached — real work was 45 tok/s, not 1,223. Use `prefix_cache_queries − hits` |
+| `external_prefix_cache_hits / queries` | disk's hit rate | denominator includes **first-time content that can never hit** |
+
+And one label: `kv_offload_tiering_*` tags tiers `tier="<idx>:<ClassName>"`, not `tier="<idx>"`.
+With a single tier everything is `tier="0:primary"`, so any counter written to exclude the
+primary reports **zero disk activity for a run that is entirely disk-served**. The transfer
+is visible instead as `kv_offload_total_bytes_total{transfer_type="CPU_to_GPU"}` — 7433 MiB
+over 16 load jobs at N=8.
 
 ## Contents
 
 | File | What it is |
 |---|---|
-| `patch_offload_streaming_restore.py` | The streamed restore: 19 idempotent, sentinel-guarded edits (12 scheduler, 4 worker, 1 metadata, 2 manager), gated on `GLM53_OFFLOAD_STREAM_RESTORE=1` |
-| `patch_offload_mmap_region.py` | Backs the primary tier's staging region with a sparse file on local NVMe instead of `/dev/shm`, gated on `GLM53_OFFLOAD_MMAP_DIR` — ported from [MiaAI PR#58](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/58) |
-| `patch_offload_nonshareable_groups.py` | Fixes defects 1, 2 and 5 plus row sizing, gated on `GLM53_OFFLOAD_GROUP_FILTER=1` |
-| `vllm_bounded_fs_tier.py` | `BoundedFileSystemTierManager` (byte cap + LRU) and `PeerMirroredFileSystemTierManager` (per-rank cascade, own-slot writes — fixes defect 3) |
-| `peer_kv_agent.py` | Runs in each remote rank's container; performs that rank's own cascade and promotion against its own region and `_r<rank>` files |
-| `tests/` | Offline suites — the patch chain against pristine upstream sources, and the batch-split arithmetic |
-| `probes/` | Every measurement harness used in this work, including the needle probes and the restore-cost fit behind the numbers above |
+| `patch_offload_mmap_region.py` | Backs the primary tier's staging region with a sparse file on local NVMe instead of `/dev/shm`, gated on `GLM53_OFFLOAD_MMAP_DIR` |
+| `patch_offload_nonshareable_groups.py` | Fixes the three upstream defects above plus row sizing, gated on `GLM53_OFFLOAD_GROUP_FILTER=1` |
+| `probes/` | The measurement harnesses, including the needle probes behind every number here |
+| `tests/` | Offline suites that apply the patch chain to pristine upstream sources |
 
 Both patches are idempotent, sentinel-guarded, and **fail closed** if upstream drifts: an
 anchor that no longer matches exactly once aborts the patch rather than half-applying it.
@@ -473,115 +211,92 @@ anchor that no longer matches exactly once aborts the patch rather than half-app
 ## Usage
 
 ```jsonc
-// kv_transfer_config
+// kv_transfer_config — one tier, and it is the disk
 {"kv_connector": "OffloadingConnector", "kv_role": "kv_both",
  "kv_connector_extra_config": {
    "spec_name": "TieringOffloadingSpec",
-   "cpu_bytes_to_use": 2147483648,          // staging buffer, not a cache
-   "eviction_policy": "lru",
-   "secondary_tiers": [{
-     "type": "PeerMirroredFileSystemTierManager",
-     "module_path": "vllm_bounded_fs_tier",  // put this file on PYTHONPATH
-     "root_dir": "/kvoffload",
-     "max_bytes": 107374182400,              // hard cap, enforced on every rank
-     "evict_to_ratio": 0.9,
-     "n_read_threads": 8, "n_write_threads": 8}]}}
+   "cpu_bytes_to_use": 260000000000,   // must exceed the GPU KV pool
+   "eviction_policy": "lru"}}
 ```
 
-Then apply the patches at container start (before the engine imports vLLM) and set:
+Apply the patches at container start, before the engine imports vLLM, and set:
 
 ```sh
+GLM53_OFFLOAD_MMAP_DIR=/kvoffload              # a directory on local NVMe, not /dev/shm
 GLM53_OFFLOAD_GROUP_FILTER=1
-GLM53_OFFLOAD_STREAM_RESTORE=1
-GLM53_OFFLOAD_REGION_COPIES=<GPUs per node>   # see note below
+GLM53_OFFLOAD_REGION_COPIES=<GPUs per node>    # see note below
 ```
+
+The region file must also be reachable at the same path inside **every** rank's container,
+and each rank creates its own.
 
 ### Operational notes
 
 > [!TIP]
-> **The CPU tier is a staging buffer, not a cache.** With the streamed restore its size no
-> longer caps restore depth — it sets the batch size, hence the number of engine steps
-> (a 1M restore is ~15 batches ~ 0.2 s at a 2 GiB tier). Size it for how many restores you
-> want *in flight at once*, not for how deep they are. This inverts the usual advice.
+> **The tier is a cache, and it must be larger than the GPU KV pool.** Size it against the
+> pool, not against how deep your sessions are. The file is sparse, so over-sizing costs
+> address space rather than disk until it is actually written.
 
-* **Fund the tier from the KV pool, not on top of it.** On unified memory (GB10) the CPU
-  tier and the GPU pool draw on the same RAM.
-* **`max_bytes` bounds every rank.** The head enforces it with LRU and mirrors each deletion
-  to the peers; each peer also sweeps its own shard oldest-first against the same cap as a
-  backstop, so a dropped message cannot leak disk.
+* **Run with `expandable_segments:True` and `--enable-cumem-allocator`.** vLLM drops
+  `PYTORCH_CUDA_ALLOC_CONF` when a KV connector is configured unless the cumem allocator is
+  explicitly enabled; on unified memory, running without expandable segments is what turns a
+  deep request into a host-memory collapse.
 * **`GLM53_OFFLOAD_REGION_COPIES`** sizes region rows by the workers that actually *share* a
   region. `tiering/spec.py` picks a worker's slot as
-  `torch.accelerator.current_device_index() % world_size`, which is the global rank only
-  when all workers sit on one node; with one GPU per host it is 0 everywhere, so every
-  worker uses slot 0 while rows are still sized for `world_size`. Opt-in and clamped — a
-  value below the real GPUs-per-node would make co-located workers share a slot and corrupt
-  each other.
-* **Clear `/dev/shm/vllm_offload_*.mmap` before launch** (defect 4) — or sidestep it with
-  `GLM53_OFFLOAD_MMAP_DIR`, which moves the region out of `/dev/shm` entirely. Count with a shell
-  glob, not `ls | wc -l` — `ls` exits 2 on no match, and under `set -e -o pipefail` that
-  silently kills the launch the moment the cleanup has nothing left to do.
-* **`PYTHONHASHSEED` must be fixed and identical everywhere**, or vLLM seeds its
-  block-content hash chain randomly and identical tokens map to different filenames on every
-  restart.
+  `torch.accelerator.current_device_index() % world_size`, which is the global rank only when
+  all workers sit on one node; with one GPU per host it is 0 everywhere, so every worker uses
+  slot 0 while rows are still sized for `world_size`. Opt-in and clamped — a value below the
+  real GPUs-per-node would make co-located workers share a slot and corrupt each other.
+* **Page cache competes with CUDA on GB10.** `cuda_free` tracks `MemFree`, not
+  `MemAvailable`, so a tier busy enough to fill page cache can starve an allocation that
+  would otherwise succeed.
+* **Offload engages from cache turnover, not from pool saturation.** `BlockPool.free_blocks`
+  appends hashed blocks to the back of the free queue and `get_new_blocks` pops from the
+  front, so every allocation recycles the oldest cached block regardless of how full the pool
+  is. Eviction is paced by allocation rate, not occupancy. The useful sizing question is not
+  "will my working set exceed the pool" but "how much prefix re-use is my workload losing to
+  turnover".
 
 ## Running the tests
 
 ```sh
-python3 tests/test_stream_split.py        # split arithmetic, 8 property classes
-python3 tests/test_streaming_patch.py     # the patch chain vs pristine upstream
-python3 probes/test_w30_2b_probe.py       # the needle probe's own scoring
-python3 probes/test_w30_probe.py
+python3 tests/test_mmap_overlay.py        # the patch chain vs pristine upstream sources
+python3 probes/test_w31_probe.py          # the concurrency probe's own scoring
 python3 probes/test_mamba_probe.py
 ```
 
-These need only a Python 3 interpreter. The two patch-chain tests apply the edits to real
-vLLM sources — point them at a copy with `PRISTINE=/path/to/site-packages/vllm`, and they
-skip with a clear message if it is absent.
+These need only a Python 3 interpreter. `test_mmap_overlay.py` applies the edits to real vLLM
+sources — point it at a copy with `PRISTINE=/path/to/site-packages/vllm`, and it skips with a
+clear message if absent. It checks anchors, compilation, idempotence, the disabled-path no-op
+and sentinel collisions.
 
-They are not decoration. `test_streaming_patch.py` caught four real defects before any
-container start, including an `@override` decorator an anchor had clipped — which would have
-silently detached `prepare_load` from its decorator — and a scheduler anchor that only exists
-after the other patch has run. `test_stream_split.py` extracts the shipped function from the
-patched source rather than testing a copy of it, and covers the case where losing the
-intra-chunk offset would shift blocks by less than one chunk: KV that loads without error and
-is quietly wrong.
-
-`tests/test_bounded_fs_tier.py` and `tests/test_peer_cascade.py` are contract tests against
-the real vLLM classes and import `vllm`, so they need it installed. That is their purpose —
-an engine upgrade that moves an API fails there rather than silently corrupting KV.
+They are not decoration. This suite caught real defects before any container start, including
+an anchor that matched a comment the patch itself had inserted — which silently skipped an
+edit and produced a server that booted fine and offloaded nothing.
 
 ## Limits
 
 > [!NOTE]
-> Every number above is measured on this stack unless explicitly marked *projected*. The
-> A/B toggles one environment variable and holds hardware, model, prompts, disk contents and
-> pool size constant.
+> Every number here is measured on this stack. Recall is verified against five needles per
+> session at distinct depths, with session-unique prefixes, so a partial restore cannot pass
+> as a full one.
 
-
-* **Restore depth is now bounded by Mamba `align`, not by the tier.** The restorable prefix
-  rounds down to an aligned chunk boundary, leaving ≤ 7168 tokens to re-prefill — which is
-  most of the 8.3 s above.
-* **Below ~130k tokens the restore fits a 2 GiB tier**, so stock vLLM serves it too and
-  streaming buys nothing. The gain is in deep sessions.
-* **The streamed restore stalls at N ≥ 6 concurrent deep restores.** An earlier version of
-  this section predicted that surplus restores would "retry and serialise rather than fail".
-  **That prediction was wrong and the measurement contradicted it.** N=2 and N=4 are clean;
-  from N=6 the requests end in `WAITING_FOR_REMOTE_KVS` with the final batch never issued.
-  Bisecting with `GLM53_OFFLOAD_STREAM_RESTORE=0` showed pristine vLLM completing the same
-  wave, which isolates the defect to `patch_offload_streaming_restore.py` — not to vLLM. One
-  real bug was found and fixed on the way (async-lookup `RETRY` churn, fixed with a memo);
-  the stall itself is **not fixed**. Treat the streamed restore as sequential-only — or use
-  the disk-backed tier instead, which runs the same ramp clean to N=8.
-* **A residual 1.64× storage overhead remains**: rows are uniform across groups, so a
-  2.48 MiB MLA payload still occupies a 25.91 MiB row. Removing it needs ragged per-group
-  rows across `config.py`, `cpu/spec.py`, `shared_offload_region.py` and the CPU worker's
-  offset arithmetic.
-* **The first restore after a boot behaves as cold**, before the disk cascade has settled.
-  Both anomalies across 15 revisits were first-after-boot; don't read one as corruption.
+* **Restore depth is bounded by Mamba `align`.** The restorable prefix rounds down to an
+  aligned chunk boundary, leaving ≤ 7168 tokens to re-prefill.
+* **Measured to N=8 concurrent.** Beyond that is untested; there was no tier pressure at N=8
+  (zero allocation retries), so the next limit is likely `max_num_seqs` rather than the tier.
+* **Deep single restores are reported at ~60k here.** The alignment tail is a constant, so
+  deeper sessions should do better, but this repository does not claim a number it has not
+  measured.
+* **`rows_per_segment` is bounded to 3–5, not pinned.** Sizing against the least favourable
+  reading makes it moot; pinning it would need a tier shrunk until restores start failing.
+* **A residual storage overhead remains**: rows are uniform across groups, so a small MLA
+  payload still occupies a full row. On a sparse file the unused tail costs address space
+  rather than disk, but it does consume a row, and rows are what LRU evicts.
 
 ## Credits
 
-This work is built on two upstream efforts, and the disk-backed design is theirs, not ours:
+The disk-backed design is not ours:
 
 * **[MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks#58](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/58)**
   ([@MiaAI_lab](https://x.com/MiaAI_lab)) — the disk-backed staging region, the residency
@@ -589,12 +304,12 @@ This work is built on two upstream efforts, and the disk-backed design is theirs
   and the observation that under-sizing the tier fails silently with every store-side metric
   still climbing.
 * **The Reederey87 GLM-5.3-Flash EXL3 serving kit** ([@Reederey](https://x.com/Reederey)) —
-  the serving recipe this entire stack runs on: the two-node TP=2 bring-up, the overlay
-  patch mechanism (idempotent, sentinel-guarded, fail-closed) that every patch here follows,
-  and the boot-time capacity log that produced the block-id breakdown above.
+  the serving recipe this entire stack runs on: the two-node TP=2 bring-up, the overlay patch
+  mechanism (idempotent, sentinel-guarded, fail-closed) that every patch here follows, and
+  the boot-time capacity log that produced the block-id breakdown above.
 
-The out-of-tree tier managers, the group/row-sizing fixes, the streamed restore and the
-measurement harnesses in `probes/` are this repository's own.
+The group and row-sizing fixes, the upstream defect analysis, and the measurement harnesses
+in `probes/` are this repository's own.
 
 ## Licence
 
